@@ -2,12 +2,15 @@
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const CHM_BASE = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+  // Chatmeter
+  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
   const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
+
+  // Zendesk
   const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-  const ZD_EMAIL = process.env.ZENDESK_EMAIL;
+  const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
   const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT;
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // checkbox custom field id
 
   const missing = [
     !CHM_TOKEN && "CHATMETER_V5_TOKEN",
@@ -35,7 +38,7 @@ export default async function handler(req, res) {
       return res.status(502).send(`Chatmeter error: ${chmRes.status} ${t}`);
     }
 
-    // 2) Mark "First Reply Sent" = true in Zendesk (optional field)
+    // 2) Mark "First Reply Sent" in Zendesk (optional if field configured)
     if (ZD_FIELD_FIRST_REPLY_SENT) {
       const auth = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
       const update = {
@@ -61,3 +64,4 @@ export default async function handler(req, res) {
     return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
+
