@@ -1,46 +1,51 @@
-// Poll Chatmeter for recent reviews and forward each to /api/review-webhook
 export default async function handler(req, res) {
-  // Optional: lock this route to Vercel Cron only
   const want = process.env.CRON_SECRET;
   const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
   if (want && got !== `Bearer ${want}`) return res.status(401).send("Unauthorized");
 
   const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;              // raw token (no "Bearer")
-  const SELF_BASE = process.env.SELF_BASE_URL;                   // e.g., https://drivo-chatmeter-bridge.vercel.app
-  const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15); // minutes
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
+  const SELF_BASE = process.env.SELF_BASE_URL;
+  const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15);
 
-  // NEW: optional scoping for reseller admins
-  const ENV_CLIENT_ID = process.env.CHM_CLIENT_ID || "";
-  const ENV_GROUP_ID  = process.env.CHM_GROUP_ID || "";
+  // existing:
+  const ENV_CLIENT_ID  = process.env.CHM_CLIENT_ID || "";
+  const ENV_GROUP_ID   = process.env.CHM_GROUP_ID  || "";
+  // NEW:
+  const ENV_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || "";
 
   const missing = [ !CHM_TOKEN && "CHATMETER_V5_TOKEN", !SELF_BASE && "SELF_BASE_URL" ].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
   try {
-    // Allow manual overrides: /api/poll-chatmeter?minutes=43200&clientId=...&groupId=...
-    let lookback = LOOKBACK, clientId = ENV_CLIENT_ID, groupId = ENV_GROUP_ID;
+    let lookback = LOOKBACK;
+    // existing:
+    let clientId  = ENV_CLIENT_ID;
+    let groupId   = ENV_GROUP_ID;
+    // NEW:
+    let accountId = ENV_ACCOUNT_ID;
+
     try {
       const urlObj = new URL(req.url, `https://${req.headers.host}`);
       const m = Number(urlObj.searchParams.get("minutes") || "");
       if (Number.isFinite(m) && m > 0) lookback = m;
-      clientId = urlObj.searchParams.get("clientId") || clientId;
-      groupId  = urlObj.searchParams.get("groupId")  || groupId;
+      clientId  = urlObj.searchParams.get("clientId")  || clientId;
+      groupId   = urlObj.searchParams.get("groupId")   || groupId;
+      // NEW:
+      accountId = urlObj.searchParams.get("accountId") || accountId;
     } catch {}
 
     const sinceIso = new Date(Date.now() - lookback * 60 * 1000).toISOString();
     const endIso   = new Date().toISOString();
 
-    // Build common query
     let baseQuery = `limit=50&sortField=reviewDate&sortOrder=DESC`;
-    if (clientId) baseQuery += `&clientId=${encodeURIComponent(clientId)}`;
-    if (groupId)  baseQuery += `&groupId=${encodeURIComponent(groupId)}`;
+    if (clientId)  baseQuery += `&clientId=${encodeURIComponent(clientId)}`;
+    if (accountId) baseQuery += `&accountId=${encodeURIComponent(accountId)}`; // NEW
+    if (groupId)   baseQuery += `&groupId=${encodeURIComponent(groupId)}`;
 
-    // First attempt: updatedSince
     const url1 = `${CHM_BASE}/reviews?${baseQuery}&updatedSince=${encodeURIComponent(sinceIso)}`;
     let items = await fetchJson(url1, CHM_TOKEN);
 
-    // Fallback: explicit start/end range
     if (!items.length) {
       const url2 = `${CHM_BASE}/reviews?${baseQuery}&startDate=${encodeURIComponent(sinceIso)}&endDate=${encodeURIComponent(endIso)}`;
       items = await fetchJson(url2, CHM_TOKEN);
@@ -78,10 +83,10 @@ export default async function handler(req, res) {
       ok: true,
       since: sinceIso,
       lookback_minutes: lookback,
-      used_clientId: clientId || null,
-      used_groupId: groupId || null,
-      checked: items.length,
-      posted, skipped, errors
+      used_clientId:  clientId  || null,
+      used_accountId: accountId || null,   // NEW
+      used_groupId:   groupId   || null,
+      checked: items.length, posted, skipped, errors
     });
   } catch (e) {
     return res.status(500).send(`Error: ${e?.message || e}`);
