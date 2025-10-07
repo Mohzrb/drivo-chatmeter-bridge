@@ -1,6 +1,6 @@
 // Poll Chatmeter for recent reviews and forward each to /api/review-webhook
 export default async function handler(req, res) {
-  // Optional: lock to Vercel Cron
+  // Optional: lock to Vercel Cron with a secret
   const want = process.env.CRON_SECRET;
   const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
   if (want && got !== `Bearer ${want}`) return res.status(401).send("Unauthorized");
@@ -12,25 +12,25 @@ export default async function handler(req, res) {
 
   // Support reseller scoping
   const ENV_CLIENT_ID  = process.env.CHM_CLIENT_ID  || "";
-  const ENV_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || ""; // <-- NEW
+  const ENV_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || ""; // NEW
   const ENV_GROUP_ID   = process.env.CHM_GROUP_ID   || "";
 
   const missing = [!CHM_TOKEN && "CHATMETER_V5_TOKEN", !SELF_BASE && "SELF_BASE_URL"].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
   try {
-    // Allow overrides via URL: /api/poll-chatmeter?minutes=43200&accountId=...&clientId=...&groupId=...
+    // Allow URL overrides: /api/poll-chatmeter?minutes=43200&accountId=...&clientId=...&groupId=...
     let lookback = LOOKBACK;
-    let clientId = ENV_CLIENT_ID;
-    let accountId = ENV_ACCOUNT_ID; // <-- NEW
-    let groupId = ENV_GROUP_ID;
+    let clientId  = ENV_CLIENT_ID;
+    let accountId = ENV_ACCOUNT_ID; // NEW
+    let groupId   = ENV_GROUP_ID;
 
     try {
       const urlObj = new URL(req.url, `https://${req.headers.host}`);
       const m = Number(urlObj.searchParams.get("minutes") || "");
       if (Number.isFinite(m) && m > 0) lookback = m;
       clientId  = urlObj.searchParams.get("clientId")  || clientId;
-      accountId = urlObj.searchParams.get("accountId") || accountId; // <-- NEW
+      accountId = urlObj.searchParams.get("accountId") || accountId; // NEW
       groupId   = urlObj.searchParams.get("groupId")   || groupId;
     } catch {}
 
@@ -40,14 +40,14 @@ export default async function handler(req, res) {
     // Build query
     let baseQuery = `limit=50&sortField=reviewDate&sortOrder=DESC`;
     if (clientId)  baseQuery += `&clientId=${encodeURIComponent(clientId)}`;
-    if (accountId) baseQuery += `&accountId=${encodeURIComponent(accountId)}`; // <-- NEW
+    if (accountId) baseQuery += `&accountId=${encodeURIComponent(accountId)}`; // NEW
     if (groupId)   baseQuery += `&groupId=${encodeURIComponent(groupId)}`;
 
-    // First try updatedSince (fast path)
+    // First: updatedSince
     const url1 = `${CHM_BASE}/reviews?${baseQuery}&updatedSince=${encodeURIComponent(sinceIso)}`;
     let items = await fetchJson(url1, CHM_TOKEN);
 
-    // Fallback to explicit range if needed
+    // Fallback: start/end range
     if (!items.length) {
       const url2 = `${CHM_BASE}/reviews?${baseQuery}&startDate=${encodeURIComponent(sinceIso)}&endDate=${encodeURIComponent(endIso)}`;
       items = await fetchJson(url2, CHM_TOKEN);
@@ -85,9 +85,9 @@ export default async function handler(req, res) {
       ok: true,
       since: sinceIso,
       lookback_minutes: lookback,
-      used_clientId: clientId || null,
-      used_accountId: accountId || null,  // <-- NEW
-      used_groupId: groupId || null,
+      used_clientId:  clientId  || null,
+      used_accountId: accountId || null,  // helpful for debugging
+      used_groupId:   groupId   || null,
       checked: items.length, posted, skipped, errors
     });
   } catch (e) {
