@@ -1,5 +1,5 @@
 {
   "crons": [
-    { "path": "/api/poll-chatmeter", "schedule": "*/15 * * * *" }
+    { "path": "/api/poll-chatmeter", "schedule": "0 6 * * *" }
   ]
 }
