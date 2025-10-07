@@ -1,27 +1,45 @@
-// poller-v2 (ultra-safe): dry-run, max cap, robust parsing, no enrichment
+// File: api/poll-v2.js
+// Poll Chatmeter for recent reviews and forward them to /api/review-webhook
+// Ultra-safe: no enrichment, supports dry-run and max cap, robust parsing.
+// Query params:
+//   minutes=<int>     (lookback; default env POLLER_LOOKBACK_MINUTES or 15)
+//   accountId=<str>   (or CHM_ACCOUNT_ID env)
+//   clientId=<str>    (or CHM_CLIENT_ID env)
+//   groupId=<str>     (or CHM_GROUP_ID env)
+//   dry=1             (test run, no tickets created)
+//   max=<1..50>       (cap items processed; default 50)
+
 export default async function handler(req, res) {
-  const VERSION = "poller-v2-ultrasafe-2025-10-07";
+  const VERSION = "poller-v2-ultrasafe+surveytext-2025-10-07";
   try {
-    // Optional auth
+    // Optional auth (recommended for cron)
     const want = process.env.CRON_SECRET;
     const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
     if (want && got !== `Bearer ${want}`) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", version: VERSION });
+      return res
+        .status(401)
+        .json({ ok: false, error: "Unauthorized", version: VERSION });
     }
 
     // Required env
     const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;        // raw token
-    const SELF_BASE = process.env.SELF_BASE_URL;             // e.g., https://drivo-chatmeter-bridge.vercel.app
+    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;      // raw token (no "Bearer")
+    const SELF_BASE = process.env.SELF_BASE_URL;           // e.g. https://<your-app>.vercel.app
     if (!CHM_TOKEN || !SELF_BASE) {
-      return res.status(500).json({ ok: false, error: "Missing env: CHATMETER_V5_TOKEN or SELF_BASE_URL", version: VERSION });
+      return res.status(500).json({
+        ok: false,
+        error: "Missing env: CHATMETER_V5_TOKEN or SELF_BASE_URL",
+        version: VERSION,
+      });
     }
 
     // Parse query
     const baseForURL = `https://${req?.headers?.host || "x.local"}`;
     const u = new URL(req.url || "/api/poll-v2", baseForURL);
 
-    const minutes = Number(u.searchParams.get("minutes") || process.env.POLLER_LOOKBACK_MINUTES || 15);
+    const minutes = Number(
+      u.searchParams.get("minutes") || process.env.POLLER_LOOKBACK_MINUTES || 15
+    );
     const clientId  = u.searchParams.get("clientId")  || process.env.CHM_CLIENT_ID  || "";
     const accountId = u.searchParams.get("accountId") || process.env.CHM_ACCOUNT_ID || "";
     const groupId   = u.searchParams.get("groupId")   || process.env.CHM_GROUP_ID   || "";
@@ -42,13 +60,18 @@ export default async function handler(req, res) {
     const r = await fetch(url, { headers: { Authorization: CHM_TOKEN } });
     const txt = await r.text();
     if (!r.ok) {
-      return res.status(502).json({ ok: false, error: `Chatmeter ${r.status}`, snippet: (txt || "").slice(0, 250), version: VERSION });
+      return res.status(502).json({
+        ok: false,
+        error: `Chatmeter ${r.status}`,
+        snippet: (txt || "").slice(0, 250),
+        version: VERSION,
+      });
     }
 
     const items = extractItems(txt);
-    let posted = 0, skipped = 0, errors = 0;
 
     // Post to our webhook (unless dry)
+    let posted = 0, skipped = 0, errors = 0;
     if (!dry) {
       for (const it of items.slice(0, maxItems)) {
         const payload = buildPayload(it);
@@ -78,7 +101,11 @@ export default async function handler(req, res) {
     });
 
   } catch (e) {
-    return res.status(500).json({ ok: false, version: "poller-v2-ultrasafe-2025-10-07", caught: String(e) });
+    return res.status(500).json({
+      ok: false,
+      version: "poller-v2-ultrasafe+surveytext-2025-10-07",
+      caught: String(e),
+    });
   }
 }
 
@@ -120,24 +147,50 @@ function buildPayload(it) {
   };
 }
 
+// Improved text extraction:
+// - keeps common top-level fields
+// - pulls free-text from survey/NPS arrays (reviewData/data/answers/fields/etc.)
+// - filters out numbers/booleans/bare "false"/"true"/"n/a" strings, keeps real phrases
 function extractText(it) {
+  const isFreeText = (v) => {
+    if (v == null) return false;
+    const s = String(v).trim();
+    if (!s) return false;
+    const low = s.toLowerCase();
+    if (["n/a","na","none","null","nil","-", "false","true"].includes(low)) return false;
+    if (/^\d+(\.\d+)?$/.test(s)) return false; // pure number
+    return s.length >= 3;
+  };
+
   const out = [];
+
+  // 1) common top-level text fields
   const fields = [
     it.text, it.reviewText, it.content, it.comment, it.message,
     it.detail, it.body, it.responseText, it.consumerComment
   ];
-  for (const f of fields) if (f) out.push(String(f).trim());
+  for (const f of fields) if (isFreeText(f)) out.push(String(f).trim());
 
-  const rd = it.reviewData || it.data || it.answers || it.fields;
-  if (Array.isArray(rd)) {
-    for (const row of rd) {
-      const name = String(row?.name ?? row?.label ?? row?.question ?? "").toLowerCase();
-      const val  = row?.value ?? row?.answer ?? row?.text ?? row?.comment ?? "";
-      if (!val) continue;
-      if (/(comment|feedback|text|review|message|free|open)/.test(name)) {
-        out.push(String(val).trim());
+  // 2) survey-like arrays
+  const candidates =
+    it.reviewData || it.data || it.answers || it.fields ||
+    it.surveyData || it.survey || it.response || [];
+
+  const rows = Array.isArray(candidates) ? candidates : [];
+  for (const row of rows) {
+    const val = row?.value ?? row?.answer ?? row?.text ?? row?.comment ?? "";
+    if (isFreeText(val)) out.push(String(val).trim());
+
+    // nested answers inside a row
+    const sub = row?.answers || row?.responses || row?.values;
+    if (Array.isArray(sub)) {
+      for (const a of sub) {
+        const aval = a?.value ?? a?.answer ?? a?.text ?? a?.comment ?? "";
+        if (isFreeText(aval)) out.push(String(aval).trim());
       }
     }
   }
-  return out.filter(Boolean).join("\n").trim();
+
+  // unique + join
+  return Array.from(new Set(out)).join("\n").trim();
 }
