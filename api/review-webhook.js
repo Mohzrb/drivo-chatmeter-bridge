@@ -2,13 +2,16 @@
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;   // e.g., drivohelp
+  // --- Required env vars ---
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;   // e.g., "drivohelp"
   const ZD_EMAIL = process.env.ZENDESK_EMAIL;
   const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-  const ZD_FIELD_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID;
-  const ZD_FIELD_LOCATION_ID = process.env.ZD_FIELD_LOCATION_ID;
-  const ZD_FIELD_RATING = process.env.ZD_FIELD_RATING;
-  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT;
+
+  // --- Optional custom fields (numeric IDs from Zendesk) ---
+  const ZD_FIELD_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID;           // text
+  const ZD_FIELD_LOCATION_ID = process.env.ZD_FIELD_LOCATION_ID;       // text
+  const ZD_FIELD_RATING = process.env.ZD_FIELD_RATING;                 // number
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // checkbox
 
   const missing = [
     !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
@@ -19,9 +22,9 @@ export default async function handler(req, res) {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const reviewId = body.id || body.reviewId || "";
-    if (!reviewId) return res.status(400).send("Missing reviewId/id");
 
+    // Normalize payload (accepts id or reviewId)
+    const reviewId     = body.id || body.reviewId || "";
     const locationId   = body.locationId ?? "";
     const locationName = body.locationName ?? "Unknown Location";
     const rating       = body.rating ?? 0;
@@ -31,6 +34,9 @@ export default async function handler(req, res) {
     const publicUrl    = body.publicUrl ?? "";
     const portalUrl    = body.portalUrl ?? "";
 
+    if (!reviewId) return res.status(400).send("Missing reviewId/id");
+
+    // Build ticket
     const subject = `${locationName} – ${rating}★ – ${authorName}`;
     const description = [
       `Review ID: ${reviewId}`,
@@ -55,6 +61,7 @@ export default async function handler(req, res) {
       }
     };
 
+    // Optional: custom field mappings
     const custom_fields = [];
     if (ZD_FIELD_REVIEW_ID)       custom_fields.push({ id: +ZD_FIELD_REVIEW_ID, value: String(reviewId) });
     if (ZD_FIELD_LOCATION_ID)     custom_fields.push({ id: +ZD_FIELD_LOCATION_ID, value: String(locationId) });
@@ -62,6 +69,7 @@ export default async function handler(req, res) {
     if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
     if (custom_fields.length) ticket.ticket.custom_fields = custom_fields;
 
+    // Zendesk API call
     const auth = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
     const zdRes = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
       method: "POST",
