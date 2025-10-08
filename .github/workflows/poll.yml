@@ -1,0 +1,21 @@
+name: Poll Chatmeter (every 15 min)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch: {}       # allows manual “Run workflow”
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Vercel poller
+        env:
+          BASE_URL: https://drivo-chatmeter-bridge.vercel.app
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}          # add in step 2
+          ACCOUNT_ID: 6646597de7a19144ba286d92            # or put this as a secret too
+        run: |
+          # keep the window small so we don't re-scan giant ranges
+          curl -sS -H "Authorization: Bearer $CRON_SECRET" \
+            "$BASE_URL/api/poll-chatmeter?accountId=$ACCOUNT_ID&minutes=20"
+
