@@ -1,30 +1,56 @@
 // api/review-webhook.js
-// Chatmeter → Zendesk webhook: idempotent upsert (no duplicate tickets)
-
 const { createOrUpdateFromChatmeter } = require("./_zd");
 
-// Custom ticket field IDs from env (must be numeric IDs from Zendesk)
 const F_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID || null;
 const F_LOCATION  = process.env.ZD_FIELD_LOCATION_ID || null;
 const F_RATING    = process.env.ZD_FIELD_RATING || null;
-const F_FIRST_RSP = process.env.ZD_FIELD_FIRST_REPLY_SENT || null;
 
-function readBody(req) {
-  if (!req.body) return {};
-  return typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+// minimal safe reader
+function safeBody(req) {
+  try {
+    if (!req.body) return {};
+    if (typeof req.body === "string") return JSON.parse(req.body || "{}");
+    return req.body;
+  } catch (e) {
+    // return raw in case parse failed
+    return { _raw: req.body, _parseError: e?.message || String(e) };
+  }
 }
 
 module.exports = async (req, res) => {
   try {
+    // quick ping
+    if (req.method === "GET" && (req.query?.ping === "1" || req.query?.dry === "1" || req.query?.test === "1")) {
+      return res.status(200).json({
+        ok: true,
+        msg: "webhook alive",
+        env: {
+          SUBDOMAIN: process.env.ZENDESK_SUBDOMAIN || null,
+          EMAIL: process.env.ZENDESK_EMAIL || null,
+          HAS_TOKEN: !!(process.env.ZENDESK_API_TOKEN || process.env.ZD_TOKEN)
+        }
+      });
+    }
+
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    const payload = readBody(req);
+    // allow dry=1 WITHOUT hitting Zendesk & WITHOUT parsing the body
+    if (req.query && (req.query.dry === "1" || req.query.test === "1")) {
+      return res.status(200).json({
+        dryRun: true,
+        ok: true,
+        note: "No Zendesk call performed"
+      });
+    }
 
-    // normalize fields from different Chatmeter shapes
+    const payload = safeBody(req);
+
     const reviewId =
       payload.reviewId || payload.review_id || payload.id || payload.review?.id || payload.payload?.review_id;
 
-    if (!reviewId) return res.status(400).json({ error: "Missing reviewId", got: payload });
+    if (!reviewId) {
+      return res.status(400).json({ error: "Missing reviewId", payload });
+    }
 
     const rating =
       payload.rating || payload.review?.rating || payload.payload?.rating || payload.stars;
@@ -46,30 +72,10 @@ module.exports = async (req, res) => {
       `Rating: ${rating ?? "N/A"} | Location: ${locationId ?? "N/A"}\n` +
       (text ? `\n${text}` : "");
 
-    // Optional DRY RUN: ?dry=1 will not touch Zendesk, returns what would be sent
-    if (req.query && (req.query.dry === "1" || req.query.test === "1")) {
-      return res.status(200).json({
-        dryRun: true,
-        wouldSend: {
-          reviewId,
-          subject,
-          body,
-          tags: ["chatmeter", "review", "google", `cmrvw_${reviewId}`],
-          external_id: `chatmeter:${reviewId}`,
-          custom_fields: [
-            ...(F_REVIEW_ID ? [{ id: Number(F_REVIEW_ID), value: reviewId }] : []),
-            ...(F_LOCATION  ? [{ id: Number(F_LOCATION),  value: String(locationId || "") }] : []),
-            ...(F_RATING    ? [{ id: Number(F_RATING),    value: rating ?? null }] : []),
-          ],
-        },
-      });
-    }
-
     const customFields = [
       ...(F_REVIEW_ID ? [{ id: Number(F_REVIEW_ID), value: reviewId }] : []),
       ...(F_LOCATION  ? [{ id: Number(F_LOCATION),  value: String(locationId || "") }] : []),
       ...(F_RATING    ? [{ id: Number(F_RATING),    value: rating ?? null }] : []),
-      // F_FIRST_RSP could be set later by a trigger when an agent replies
     ];
 
     const result = await createOrUpdateFromChatmeter({
@@ -78,12 +84,12 @@ module.exports = async (req, res) => {
       body,
       requester: "reviews@drivo.com",
       tags: ["chatmeter", "review", "google"],
-      customFields,
+      customFields
     });
 
     return res.status(200).json(result);
   } catch (e) {
-    const detail = e?.response?.data || e?.message || e?.toString?.() || "unknown_error";
+    const detail = e?.response?.data || e?.message || e?.stack || String(e);
     console.error("review-webhook error:", detail);
     return res.status(500).json({ error: "zendesk_upsert_failed", detail });
   }
