@@ -1,23 +1,21 @@
-// Chatmeter → Zendesk (idempotent upsert, resilient lookup, beige internal card)
-// ESM / Vercel-compatible
-
+// Chatmeter → Zendesk (create ticket, idempotent)
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
   const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
-  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN || process.env.ZD_TOKEN;
+  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
 
-  const ZD_FIELD_REVIEW_ID        = process.env.ZD_FIELD_REVIEW_ID;
-  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;
-  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME; // optional
-  const ZD_FIELD_RATING           = process.env.ZD_FIELD_RATING;
-  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // optional
+  const ZD_FIELD_REVIEW_ID        = process.env.ZD_FIELD_REVIEW_ID;        // text
+  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;      // text/dropdown
+  const ZD_FIELD_RATING           = process.env.ZD_FIELD_RATING;           // number
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // checkbox
+  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME;    // optional text/dropdown
 
   const missing = [
     !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
     !ZD_EMAIL && "ZENDESK_EMAIL",
-    !ZD_API_TOKEN && "ZENDESK_API_TOKEN/ZD_TOKEN",
+    !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
   ].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
@@ -37,138 +35,115 @@ export default async function handler(req, res) {
   };
 
   try {
-    const b = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-
-    // --- normalize inputs (cover common synonyms; keep your canonical keys first) ---
-    const reviewId     = str(b.id ?? b.reviewId ?? b.review_id);
+    const b = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const reviewIdRaw = b.id || b.reviewId || b.review_id;
+    const reviewId = reviewIdRaw ? String(reviewIdRaw).trim() : "";
     if (!reviewId) return res.status(400).send("Missing review id");
 
-    const rating       = num(b.rating ?? b.stars);
-    const locationId   = str(b.locationId ?? b.location_id);
-    const locationName = str(b.locationName ?? b.location ?? b.businessName ?? "Location");
-    const authorName   = str(b.authorName ?? b.author ?? b.reviewer ?? "Reviewer");
-    const createdAt    = str(b.createdAt ?? b.date ?? b.review_date ?? b.created_at);
-    const text         = str(b.text ?? b.comment ?? b.reviewText ?? b.review_text ?? b.content ?? b.body ?? "");
-    const publicUrl    = str(b.publicUrl ?? b.public_url ?? b.reviewURL ?? b.url ?? b.link ?? "");
-    const provider     = inferProvider(str(b.provider ?? b.source ?? b.contentProvider), publicUrl);
+    const locationId   = toStr(b.locationId);
+    const locationName = toStr(b.locationName) || "Unknown";
+    const rating       = toNum(b.rating, 0);
+    const authorName   = toStr(b.authorName) || "Chatmeter Reviewer";
+    const createdAt    = toStr(b.createdAt);
+    const text         = toStr(b.text || b.comment || b.reviewText);
+    const publicUrl    = toStr(b.publicUrl || b.reviewURL);
+    const provider     = toStr(b.provider || b.contentProvider).toUpperCase();
 
-    // idempotency key / unique tag
     const externalId = `chatmeter:${reviewId}`;
     const uniqueTag  = `cmrvw_${reviewId.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 60)}`;
-    const providerTag = provider ? provider.toLowerCase() : undefined;
 
-    // ---------- RESILIENT LOOKUP (prevents duplicates) ----------
-    // A) Fast path: show_many by external_id (no search lag)
-    let ticketId = await lookupByExternalId(Z, externalId);
+    // ---------- LOOKUP ----------
+    // Try show_many first (no search index lag). If non-OK, fall back to search.
+    let foundTicketId = null;
+    {
+      const lookup = await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
+      if (lookup.ok) {
+        const t = lookup.json?.tickets?.[0];
+        if (t?.id) foundTicketId = t.id;
+      }
+    }
+    if (!foundTicketId) {
+      const q = encodeURIComponent(`type:ticket external_id:"${externalId}"`);
+      const sr = await Z(`/api/v2/search.json?query=${q}&per_page=1`);
+      if (sr.ok && Array.isArray(sr.json?.results) && sr.json.results[0]?.id) {
+        foundTicketId = sr.json.results[0].id;
+      }
+    }
 
-    // B) Fallback: Search API by external_id
-    if (!ticketId) ticketId = await searchOne(Z, `type:ticket external_id:"${externalId}"`);
+    if (foundTicketId) {
+      // Light touch (no noisy notes)
+      await lightTouch(foundTicketId, Z);
+      return res.status(200).json({ ok: true, deduped: true, via: "lookup", ticketId: foundTicketId });
+    }
 
-    // C) Last-resort: search by our unique tag (covers very early tickets created w/o external_id)
-    if (!ticketId) ticketId = await searchOne(Z, `type:ticket tags:${uniqueTag}`);
+    // ---------- CREATE ----------
+    const subject = `${locationName} – ${rating}★ – ${authorName}`;
+    const description = [
+      `Review ID: ${reviewId}`,
+      `Provider: ${provider || "N/A"}`,
+      `Location: ${locationName}${locationId ? ` (${locationId})` : ""}`,
+      `Rating: ${rating}★`,
+      createdAt ? `Date: ${createdAt}` : "",
+      "",
+      "Review Text:",
+      text || "(no text)",
+      "",
+      "Public URL:",
+      publicUrl || "(none)"
+    ].filter(Boolean).join("\n");
 
-    // Card body (plain text → renders as beige internal note)
-    const body = buildCard({ reviewId, provider, locationName, locationId, rating, createdAt, text, publicUrl });
-
-    // Common custom fields array
     const custom_fields = [];
     if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID,        value: reviewId });
     if (ZD_FIELD_LOCATION_ID)      custom_fields.push({ id: +ZD_FIELD_LOCATION_ID,      value: locationId });
-    if (ZD_FIELD_LOCATION_NAME && locationName) custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName });
-    if (ZD_FIELD_RATING)           custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating || null });
+    if (ZD_FIELD_RATING)           custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating });
     if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
-
-    const subject = `${locationName} – ${rating || "?"}★ – ${authorName}`;
-
-    if (ticketId) {
-      // ---------- UPDATE (idempotent path) ----------
-      const upd = await Z(`/api/v2/tickets/${ticketId}.json`, {
-        method: "PUT",
-        body: JSON.stringify({
-          ticket: {
-            comment: { body, public: false },            // internal beige card
-            tags: ["chatmeter", "review", uniqueTag, providerTag].filter(Boolean),
-            ...(custom_fields.length ? { custom_fields } : {})
-          }
-        })
-      });
-      if (!upd.ok) return res.status(502).send(`Zendesk update error: ${upd.status} ${upd.text}`);
-      return res.status(200).json({ ok: true, action: "updated", ticketId });
+    if (ZD_FIELD_LOCATION_NAME && locationName) {
+      custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName });
     }
 
-    // ---------- CREATE (idempotent with Idempotency-Key) ----------
     const create = await Z(`/api/v2/tickets.json`, {
       method: "POST",
-      headers: { "Idempotency-Key": externalId },
+      headers: { "Idempotency-Key": externalId }, // collapse near-simultaneous creates
       body: JSON.stringify({
         ticket: {
           external_id: externalId,
           subject,
-          comment: { body, public: false },              // internal beige card on create
+          comment: { body: description, public: true }, // public first message to avoid internal-note spam
           requester: { name: authorName, email: "reviews@drivo.com" },
-          tags: ["chatmeter", "review", uniqueTag, providerTag].filter(Boolean),
-          ...(custom_fields.length ? { custom_fields } : {})
+          custom_fields,
+          tags: ["chatmeter", "review", uniqueTag, provider.toLowerCase()].filter(Boolean)
         }
       })
     });
-    if (!create.ok) return res.status(502).send(`Zendesk create error: ${create.status} ${create.text}`);
 
-    // warm up cache so future lookups see it immediately
-    await lookupByExternalId(Z, externalId).catch(()=>{});
+    if (!create.ok) {
+      return res.status(502).send(`Zendesk create error: ${create.status} ${create.text}`);
+    }
+
     const createdId = create.json?.ticket?.id ?? null;
-    return res.status(200).json({ ok: true, action: "created", ticketId: createdId });
 
+    // warm-up show_many so subsequent calls see it immediately
+    await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
+
+    return res.status(200).json({ ok: true, createdTicketId: createdId });
   } catch (e) {
     return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
 
-/* ---------- helpers ---------- */
+async function lightTouch(ticketId, Z) {
+  try {
+    await Z(`/api/v2/tickets/${ticketId}.json`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ticket: {
+          tags: ["chatmeter", "review", "deduped"]
+        }
+      })
+    });
+  } catch { /* ignore */ }
+}
 
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
-const str = (v) => (v === undefined || v === null ? "" : String(v).trim());
-const num = (v) => (v === undefined || v === null || String(v).trim()==="" ? null : Number(v));
-
-function inferProvider(p, url) {
-  const x = (p || "").toUpperCase();
-  if (x) return x;
-  try {
-    if (url) {
-      const h = new URL(url).hostname;
-      if (/google/i.test(h)) return "GOOGLE";
-      if (/yelp/i.test(h)) return "YELP";
-      if (/facebook|fb\.com/i.test(h)) return "FACEBOOK";
-      if (/chatmeter/i.test(h)) return "REVIEWBUILDER";
-    }
-  } catch {}
-  return "PROVIDER";
-}
-
-function buildCard({ reviewId, provider, locationName, locationId, rating, createdAt, text, publicUrl }) {
-  const lines = [
-    `Review ID: ${reviewId}`,
-    `Provider: ${provider || "N/A"}`,
-    `Location: ${locationName || "Location"}${locationId ? ` (${locationId})` : ""}`,
-    `Rating: ${rating ?? "N/A"}★`,
-    `Date: ${createdAt || "N/A"}`,
-    `Review Text:`,
-    ``,
-    text || `(no text)`,
-    ``,
-    `Public URL:`,
-    publicUrl || `(none)`
-  ];
-  return lines.join("\n");
-}
-
-async function lookupByExternalId(Z, externalId) {
-  const r = await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
-  if (r.ok && r.json?.tickets?.[0]?.id) return r.json.tickets[0].id;
-  return null;
-}
-
-async function searchOne(Z, query) {
-  const r = await Z(`/api/v2/search.json?query=${encodeURIComponent(query)}&per_page=1`);
-  if (r.ok && Array.isArray(r.json?.results) && r.json.results[0]?.id) return r.json.results[0].id;
-  return null;
-}
+function toStr(v) { return (v === null || v === undefined) ? "" : String(v); }
+function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
