@@ -15,7 +15,7 @@ const ZH      = { Authorization: AUTH, "Content-Type": "application/json" };
 
 function ensureZendeskEnv() {
   if (!SUB || !EMAIL || !TOKEN) {
-    const err = new Error("Missing Zendesk env vars (need ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN or ZD_TOKEN)");
+    const err = new Error("Missing Zendesk env vars (ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN/ZD_TOKEN)");
     err.code = "NO_ZENDESK_ENV";
     throw err;
   }
@@ -29,10 +29,19 @@ async function findByExternalId(externalId) {
 }
 
 /**
- * Upsert ticket.
- * If htmlBody is provided, it will be used (html_body). Otherwise plain body.
+ * Upsert ticket (no dupes).
+ * By default, writes an **internal** note (public: false) so it renders with the beige bubble.
  */
-async function createOrUpdateFromChatmeter({ reviewId, subject, body, htmlBody, requester = "reviews@drivo.com", tags = ["chatmeter","review","google"], customFields = [] }) {
+async function createOrUpdateFromChatmeter({
+  reviewId,
+  subject,
+  body,
+  htmlBody,
+  requester = "reviews@drivo.com",
+  tags = ["chatmeter","review","google"],
+  customFields = [],
+  isPublic = false   // <-- INTERNAL by default
+}) {
   ensureZendeskEnv();
   if (!reviewId) throw new Error("Missing reviewId");
 
@@ -40,10 +49,10 @@ async function createOrUpdateFromChatmeter({ reviewId, subject, body, htmlBody, 
   const tagId = `cmrvw_${reviewId}`;
   const allTags = Array.from(new Set([...tags, tagId]));
 
-  // find existing
+  // update if exists
   const existing = await findByExternalId(externalId);
   if (existing) {
-    const ticket = { tags: allTags, comment: { public: true } };
+    const ticket = { tags: allTags, comment: { public: isPublic } };
     if (htmlBody) ticket.comment.html_body = htmlBody; else ticket.comment.body = body || "";
     await axios.put(`${ZD_BASE}/tickets/${existing.id}.json`, { ticket }, { headers: ZH });
     return { action: "updated", id: existing.id, externalId };
@@ -55,7 +64,7 @@ async function createOrUpdateFromChatmeter({ reviewId, subject, body, htmlBody, 
     external_id: externalId,
     requester: { email: requester },
     tags: allTags,
-    comment: { public: true }
+    comment: { public: isPublic }
   };
   if (htmlBody) ticket.comment.html_body = htmlBody; else ticket.comment.body = body || "";
   if (customFields?.length) ticket.custom_fields = customFields.map(cf => ({ id: Number(cf.id), value: cf.value }));
