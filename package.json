@@ -2,10 +2,8 @@
   "name": "drivo-chatmeter-bridge",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
-    "dev": "vercel dev",
-    "build": "echo \"Vercel builds serverless functions automatically\"",
-    "start": "vercel dev"
+    "build": "echo \"Vercel builds serverless functions automatically\""
   }
 }
