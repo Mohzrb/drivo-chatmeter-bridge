@@ -1,146 +1,149 @@
-// Poll Chatmeter for recent reviews and forward to /api/review-webhook
+// Chatmeter → Zendesk (create ticket, idempotent)
 export default async function handler(req, res) {
-  // Require CRON_SECRET (Vercel Cron sends Authorization: Bearer <CRON_SECRET>)
-  const want = process.env.CRON_SECRET || "";
-  const got  = req.headers?.authorization || req.headers?.Authorization || "";
-  if (want && got !== `Bearer ${want}`) {
-    return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-08" });
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;          // raw token (no "Bearer")
-  const SELF_BASE = process.env.SELF_BASE_URL;               // e.g., https://drivo-chatmeter-bridge.vercel.app
-  const LOC_MAP   = parseJSON(process.env.LOCATION_MAP_JSON || "{}", {}); // {"1001892551":"JFK",...}
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
+  const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
+  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
 
-  if (!CHM_TOKEN) return res.status(500).json({ ok: false, error: "Missing CHATMETER_V5_TOKEN" });
-  if (!SELF_BASE) return res.status(500).json({ ok: false, error: "Missing SELF_BASE_URL" });
+  const ZD_FIELD_REVIEW_ID        = process.env.ZD_FIELD_REVIEW_ID;        // text
+  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;      // text/dropdown
+  const ZD_FIELD_RATING           = process.env.ZD_FIELD_RATING;           // number
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // checkbox
+  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME;    // optional text/dropdown
+
+  const missing = [
+    !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
+    !ZD_EMAIL && "ZENDESK_EMAIL",
+    !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
+  ].filter(Boolean);
+  if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
+
+  const authBasic = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
+  const Z = async (path, init = {}) => {
+    const r = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": `Basic ${authBasic}`,
+        ...(init.headers || {})
+      }
+    });
+    const text = await r.text();
+    return { ok: r.ok, status: r.status, text, json: safeParse(text, {}) };
+  };
 
   try {
-    const url = new URL(req.url, "http://localhost");
-    const minutes   = toInt(url.searchParams.get("minutes"), 15);
-    const dry       = url.searchParams.get("dry") === "1";
-    const maxItems  = toInt(url.searchParams.get("max"), 50);
-    const clientId  = strOrEmpty(url.searchParams.get("clientId") || process.env.CHM_CLIENT_ID);
-    const accountId = strOrEmpty(url.searchParams.get("accountId") || process.env.CHM_ACCOUNT_ID);
-    const groupId   = strOrEmpty(url.searchParams.get("groupId") || process.env.CHM_GROUP_ID);
+    const b = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const reviewIdRaw = b.id || b.reviewId || b.review_id;
+    const reviewId = reviewIdRaw ? String(reviewIdRaw).trim() : "";
+    if (!reviewId) return res.status(400).send("Missing review id");
 
-    const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+    const locationId   = toStr(b.locationId);
+    const locationName = toStr(b.locationName) || "Unknown";
+    const rating       = toNum(b.rating, 0);
+    const authorName   = toStr(b.authorName) || "Chatmeter Reviewer";
+    const createdAt    = toStr(b.createdAt);
+    const text         = toStr(b.text || b.comment || b.reviewText);
+    const publicUrl    = toStr(b.publicUrl || b.reviewURL);
+    const provider     = toStr(b.provider || b.contentProvider).toUpperCase();
 
-    const params = new URLSearchParams();
-    params.set("limit", String(Math.min(50, Math.max(1, maxItems))));
-    params.set("sortField", "reviewDate");
-    params.set("sortOrder", "DESC");
-    params.set("updatedSince", sinceIso);
-    if (clientId)  params.set("clientId",  clientId);
-    if (accountId) params.set("accountId", accountId);
-    if (groupId)   params.set("groupId",   groupId);
+    const externalId = `chatmeter:${reviewId}`;
+    const uniqueTag  = `cmrvw_${reviewId.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 60)}`;
 
-    const listUrl = `${CHM_BASE}/reviews?${params.toString()}`;
-    const first = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
-    const firstTxt = await first.text();
-    if (!first.ok) {
-      return res.status(502).json({ ok: false, error: `Chatmeter list error: ${first.status} ${firstTxt}` });
+    // ---------- LOOKUP ----------
+    // Try show_many first (no search index lag). If non-OK, fall back to search.
+    let foundTicketId = null;
+    {
+      const lookup = await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
+      if (lookup.ok) {
+        const t = lookup.json?.tickets?.[0];
+        if (t?.id) foundTicketId = t.id;
+      }
     }
-
-    // Chatmeter can return {reviews:[...]} or raw array
-    const parsed = safeParse(firstTxt, {});
-    const items = Array.isArray(parsed) ? parsed
-                : Array.isArray(parsed.reviews) ? parsed.reviews
-                : Array.isArray(parsed.results) ? parsed.results
-                : [];
-
-    let posted = 0, skipped = 0, errors = 0;
-    const toProcess = items.slice(0, maxItems);
-
-    for (const it of toProcess) {
-      const id = it?.id || it?.reviewId || it?.review_id || null;
-      if (!id) { skipped++; continue; }
-
-      const rating     = toInt(it?.rating, 0);
-      const provider   = (it?.contentProvider || it?.provider || "").toString().toUpperCase();
-      const reviewDate = it?.reviewDate || it?.createdAt || "";
-      const author     = it?.reviewerUserName || it?.authorName || "Chatmeter Reviewer";
-      const reviewURL  = it?.reviewURL || it?.publicUrl || "";
-      const locationId = it?.locationId ? String(it.locationId) : "";
-      const locationName = LOC_MAP[locationId] || it?.locationName || "Unknown";
-
-      const text = pickText(it);
-
-      const payload = {
-        id: String(id),
-        locationId,
-        locationName,
-        rating,
-        authorName: author,
-        createdAt: reviewDate,
-        text,
-        publicUrl: reviewURL,
-        provider
-      };
-
-      if (dry) { posted++; continue; }
-
-      try {
-        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        if (!resp.ok) { errors++; continue; }
-        posted++;
-      } catch {
-        errors++;
+    if (!foundTicketId) {
+      const q = encodeURIComponent(`type:ticket external_id:"${externalId}"`);
+      const sr = await Z(`/api/v2/search.json?query=${q}&per_page=1`);
+      if (sr.ok && Array.isArray(sr.json?.results) && sr.json.results[0]?.id) {
+        foundTicketId = sr.json.results[0].id;
       }
     }
 
-    return res.status(200).json({
-      ok: true,
-      version: "poller-v2-2025-10-08",
-      echo: {
-        rawUrl: req.url,
-        minutes,
-        clientId:  clientId || "",
-        accountId: accountId || "",
-        groupId:   groupId || "",
-        dry,
-        maxItems
-      },
-      since: sinceIso,
-      checked: toProcess.length,
-      posted, skipped, errors,
-      debug: { url: listUrl, body_snippet: (firstTxt || "").slice(0, 240) }
+    if (foundTicketId) {
+      // Light touch (no noisy notes)
+      await lightTouch(foundTicketId, Z);
+      return res.status(200).json({ ok: true, deduped: true, via: "lookup", ticketId: foundTicketId });
+    }
+
+    // ---------- CREATE ----------
+    const subject = `${locationName} – ${rating}★ – ${authorName}`;
+    const description = [
+      `Review ID: ${reviewId}`,
+      `Provider: ${provider || "N/A"}`,
+      `Location: ${locationName}${locationId ? ` (${locationId})` : ""}`,
+      `Rating: ${rating}★`,
+      createdAt ? `Date: ${createdAt}` : "",
+      "",
+      "Review Text:",
+      text || "(no text)",
+      "",
+      "Public URL:",
+      publicUrl || "(none)"
+    ].filter(Boolean).join("\n");
+
+    const custom_fields = [];
+    if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID,        value: reviewId });
+    if (ZD_FIELD_LOCATION_ID)      custom_fields.push({ id: +ZD_FIELD_LOCATION_ID,      value: locationId });
+    if (ZD_FIELD_RATING)           custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating });
+    if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
+    if (ZD_FIELD_LOCATION_NAME && locationName) {
+      custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName });
+    }
+
+    const create = await Z(`/api/v2/tickets.json`, {
+      method: "POST",
+      headers: { "Idempotency-Key": externalId }, // collapse near-simultaneous creates
+      body: JSON.stringify({
+        ticket: {
+          external_id: externalId,
+          subject,
+          comment: { body: description, public: true }, // public first message to avoid internal-note spam
+          requester: { name: authorName, email: "reviews@drivo.com" },
+          custom_fields,
+          tags: ["chatmeter", "review", uniqueTag, provider.toLowerCase()].filter(Boolean)
+        }
+      })
     });
+
+    if (!create.ok) {
+      return res.status(502).send(`Zendesk create error: ${create.status} ${create.text}`);
+    }
+
+    const createdId = create.json?.ticket?.id ?? null;
+
+    // warm-up show_many so subsequent calls see it immediately
+    await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
+
+    return res.status(200).json({ ok: true, createdTicketId: createdId });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
 
-// ---- helpers ----
-function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
-function parseJSON(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
-function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
-function strOrEmpty(v) { return v ? String(v) : ""; }
-
-function pickText(it) {
-  // 1) obvious fields
-  const direct = it?.text || it?.reviewText || it?.content || "";
-  if (direct) return String(direct);
-
-  // 2) reviewData array from Chatmeter v5
-  const rd = Array.isArray(it?.reviewData) ? it.reviewData : [];
-  const get = (names) => {
-    for (const name of names) {
-      const f = rd.find(x => (x?.name || "").toLowerCase() === name);
-      if (f?.value) return String(f.value);
-    }
-    return "";
-  };
-
-  // Try common keys used by Chatmeter / providers
-  const text =
-    get(["review_text", "reviewtext", "review_content", "content", "comment", "comments"]) ||
-    get(["nps_comment", "np_comment", "np_content_1", "free_text", "freeText"]) ||
-    "";
-
-  return text;
+async function lightTouch(ticketId, Z) {
+  try {
+    await Z(`/api/v2/tickets/${ticketId}.json`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ticket: {
+          tags: ["chatmeter", "review", "deduped"]
+        }
+      })
+    });
+  } catch { /* ignore */ }
 }
+
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+function toStr(v) { return (v === null || v === undefined) ? "" : String(v); }
+function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
