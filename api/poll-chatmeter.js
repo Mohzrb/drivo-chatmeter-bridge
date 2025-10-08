@@ -120,3 +120,15 @@ async function fetchJsonOrEmpty(url, token) {
   }
 }
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+const { createOrUpdateFromChatmeter } = require("./_zd");
+
+// ...
+await createOrUpdateFromChatmeter({
+  reviewId,                 // string
+  subject,                  // string
+  body,                     // string
+  requester: "reviews@drivo.com",
+  tags: ["chatmeter","review","google"],
+  customFieldId: process.env.ZD_CHATMETER_REVIEW_ID_FIELD
+});
+
