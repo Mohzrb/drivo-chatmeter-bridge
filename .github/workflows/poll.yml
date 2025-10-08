@@ -2,8 +2,8 @@ name: Poll Chatmeter (every 15 min)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
-  workflow_dispatch: {}       # allow manual run
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
 
 jobs:
   poll:
@@ -18,5 +18,3 @@ jobs:
           set -e
           curl -sS -H "Authorization: Bearer $CRON_SECRET" \
             "$BASE_URL/api/poll-v2?minutes=20&accountId=$ACCOUNT_ID&max=50"
-
-
