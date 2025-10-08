@@ -1,21 +1,21 @@
-// poller-v2 (enriched): robust text extraction + location name hydration + debug
+// poller-v2 (safe): robust text parsing, optional location enrichment, timeouts & concurrency
 export default async function handler(req, res) {
-  const VERSION = "poller-v2-enriched-2025-10-07";
+  const VERSION = "poller-v2-safe-2025-10-07";
 
-  // protect with CRON_SECRET if set
+  // Optional auth
   const want = process.env.CRON_SECRET;
   const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
   if (want && got !== `Bearer ${want}`) {
     return res.status(401).json({ ok: false, error: "Unauthorized", version: VERSION });
   }
 
-  // required env
+  // Env
   const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;    // raw token (no "Bearer")
-  const SELF_BASE = process.env.SELF_BASE_URL;         // e.g., https://drivo-chatmeter-bridge.vercel.app
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;       // raw token (no "Bearer")
+  const SELF_BASE = process.env.SELF_BASE_URL;            // e.g. https://drivo-chatmeter-bridge.vercel.app
   const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15);
+  const ENV_ENRICH_DEFAULT = String(process.env.ENRICH_LOCATIONS || "false").toLowerCase() === "true";
 
-  // optional default scopes for reseller/admin tokens
   const ENV_CLIENT_ID  = process.env.CHM_CLIENT_ID  || "";
   const ENV_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || "";
   const ENV_GROUP_ID   = process.env.CHM_GROUP_ID   || "";
@@ -25,32 +25,35 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: `Missing env: ${missing.join(", ")}`, version: VERSION });
   }
 
-  // parse query overrides
+  // Query params
   let lookback = LOOKBACK;
   let clientId  = ENV_CLIENT_ID;
   let accountId = ENV_ACCOUNT_ID;
   let groupId   = ENV_GROUP_ID;
+  let enrich    = ENV_ENRICH_DEFAULT;
 
   const rawUrl = req.url || "";
-  let urlMinutes = null, urlClientId = null, urlAccountId = null, urlGroupId = null;
+  let urlMinutes = null, urlClientId = null, urlAccountId = null, urlGroupId = null, urlEnrich = null;
   try {
     const u = new URL(rawUrl, `https://${req.headers.host}`);
     urlMinutes   = u.searchParams.get("minutes");
     urlClientId  = u.searchParams.get("clientId");
     urlAccountId = u.searchParams.get("accountId");
     urlGroupId   = u.searchParams.get("groupId");
+    urlEnrich    = u.searchParams.get("enrich");
 
     const m = Number(urlMinutes || "");
     if (Number.isFinite(m) && m > 0) lookback = m;
     if (urlClientId)  clientId  = urlClientId;
     if (urlAccountId) accountId = urlAccountId;
     if (urlGroupId)   groupId   = urlGroupId;
+    if (urlEnrich != null) enrich = ["1","true","yes","on"].includes(String(urlEnrich).toLowerCase());
   } catch {}
 
   const sinceIso = new Date(Date.now() - lookback * 60 * 1000).toISOString();
   const endIso   = new Date().toISOString();
 
-  // base query for Chatmeter
+  // Base query
   let baseQuery = `limit=50&sortField=reviewDate&sortOrder=DESC`;
   if (clientId)  baseQuery += `&clientId=${encodeURIComponent(clientId)}`;
   if (accountId) baseQuery += `&accountId=${encodeURIComponent(accountId)}`;
@@ -60,7 +63,7 @@ export default async function handler(req, res) {
   const url1 = `${CHM_BASE}/reviews?${baseQuery}&updatedSince=${encodeURIComponent(sinceIso)}`;
   const first = await fetchWithPeek(url1, CHM_TOKEN);
 
-  // fallback: explicit start/end
+  // fallback
   let items = first.items;
   let second = null;
   if (!items.length) {
@@ -69,35 +72,46 @@ export default async function handler(req, res) {
     items = second.items;
   }
 
-  // hydrate missing location names (batch simple: one-by-one with cache)
-  const locMap = await hydrateLocationNames(items, CHM_BASE, CHM_TOKEN);
+  // Optional enrichment with limits (kept tiny to avoid timeouts)
+  let locMap = {};
+  let enrichStats = { enabled: enrich, resolved: 0, attempted: 0, capped: false };
+  if (enrich && items.length) {
+    const cap = 25;              // at most 25 lookups
+    const concurrency = 6;       // at most 6 in-flight
+    const timeoutMs = 3500;      // each call max 3.5s
 
-  // push to /api/review-webhook
+    const need = new Set();
+    for (const it of items) {
+      const hasName = Boolean(it.locationName || it.location_name || it.location);
+      const id = it.locationId ?? it.location_id ?? it.providerLocationId;
+      if (!hasName && id) need.add(String(id));
+      if (need.size >= cap) break;
+    }
+
+    enrichStats.attempted = need.size;
+    enrichStats.capped = need.size >= cap;
+
+    locMap = await hydrateLocationsConcurrent([...need], CHM_BASE, CHM_TOKEN, concurrency, timeoutMs);
+    enrichStats.resolved = Object.keys(locMap).length;
+  }
+
+  // Send to webhook
   let posted = 0, skipped = 0, errors = 0;
   for (const it of items) {
     const id =
-      it?.id ??
-      it?.reviewId ??
-      it?.review_id ??
-      it?.reviewID ??
-      it?.providerReviewId ?? null;
+      it?.id ?? it?.reviewId ?? it?.review_id ?? it?.reviewID ?? it?.providerReviewId ?? null;
     if (!id) { skipped++; continue; }
 
     const locationId =
-      it.locationId ??
-      it.location_id ??
-      it.providerLocationId ?? "";
+      it.locationId ?? it.location_id ?? it.providerLocationId ?? "";
 
     const locationName =
-      it.locationName ??
-      it.location_name ??
-      it.location ??
-      (locationId ? (locMap[`${locationId}`] || "") : "") ||
-      "Unknown";
+      it.locationName ?? it.location_name ?? it.location ??
+      (locationId ? (locMap[`${locationId}`] || "") : "") || "Unknown";
 
-    const rating = it.rating ?? it.stars ?? it.score ?? 0;
+    const rating =
+      it.rating ?? it.stars ?? it.score ?? 0;
 
-    // author + links from ReviewBuilder shape
     const authorName =
       it.authorName ?? it.reviewerUserName ?? it.reviewerName ?? it.author ?? "Chatmeter Reviewer";
 
@@ -137,14 +151,14 @@ export default async function handler(req, res) {
   return res.status(200).json({
     ok: true,
     version: VERSION,
-    echo: { rawUrl, urlMinutes, urlClientId, urlAccountId, urlGroupId },
+    echo: { rawUrl, urlMinutes, urlClientId, urlAccountId, urlGroupId, urlEnrich },
     since: sinceIso,
     lookback_minutes: lookback,
     used_clientId:  clientId  || null,
     used_accountId: accountId || null,
     used_groupId:   groupId   || null,
     checked: items.length, posted, skipped, errors,
-    enrichment: { locations_resolved: Object.keys(locMap).length },
+    enrichment: enrichStats,
     debug: {
       first:  { url: first.url,  status: first.status,  ok: first.ok,  body_snippet: first.bodySnippet },
       second: second && { url: second.url, status: second.status, ok: second.ok, body_snippet: second.bodySnippet }
@@ -159,13 +173,7 @@ async function fetchWithPeek(url, token) {
     const r = await fetch(url, { headers: { Authorization: token } });
     const txt = await r.text();
     const items = r.ok ? extractItems(txt) : [];
-    return {
-      url,
-      status: r.status,
-      ok: r.ok,
-      bodySnippet: (txt || "").slice(0, 300),
-      items
-    };
+    return { url, status: r.status, ok: r.ok, bodySnippet: (txt || "").slice(0, 300), items };
   } catch (e) {
     return { url, status: 0, ok: false, bodySnippet: String(e), items: [] };
   }
@@ -181,7 +189,7 @@ function extractItems(txt) {
   return [];
 }
 
-// try many likely fields + mine from reviewData[]
+// Pull free-text from many possible fields + from reviewData[] pairs
 function extractText(it) {
   const candidates = [
     it.text, it.reviewText, it.content, it.comment, it.message,
@@ -191,7 +199,6 @@ function extractText(it) {
     .map(x => (x == null ? "" : String(x).trim()))
     .filter(Boolean);
 
-  // ReviewBuilder often returns an array of { name, value } pairs
   const rd = it.reviewData || it.data || it.answers || it.fields;
   const fromRD = [];
   if (Array.isArray(rd)) {
@@ -205,32 +212,44 @@ function extractText(it) {
     }
   }
 
-  const result = [...cleaned, ...fromRD].filter(Boolean).join("\n").trim();
-  return result;
+  return [...cleaned, ...fromRD].filter(Boolean).join("\n").trim();
 }
 
-// fetch missing location names using /locations/{id}
-async function hydrateLocationNames(items, base, token) {
-  const need = new Set();
-  for (const it of items) {
-    const hasName = Boolean(it.locationName || it.location_name || it.location);
-    const id = it.locationId ?? it.location_id ?? it.providerLocationId;
-    if (!hasName && id) need.add(String(id));
+// Concurrency + timeout capped location hydration
+async function hydrateLocationsConcurrent(ids, base, token, maxConcurrent = 6, timeoutMs = 3500) {
+  const out = Object.create(null);
+  const queue = ids.slice();
+  const workers = Array.from({ length: Math.min(maxConcurrent, queue.length) }, () =>
+    (async function run() {
+      while (queue.length) {
+        const id = queue.shift();
+        try {
+          const name = await fetchLocationNameWithTimeout(base, token, id, timeoutMs);
+          if (name) out[id] = name;
+        } catch {}
+      }
+    })()
+  );
+  await Promise.all(workers);
+  return out;
+}
+
+async function fetchLocationNameWithTimeout(base, token, id, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${base}/locations/${encodeURIComponent(id)}`, {
+      headers: { Authorization: token },
+      signal: ctrl.signal
+    });
+    if (!r.ok) return "";
+    const d = safeParse(await r.text(), {});
+    return d?.name ?? d?.locationName ?? d?.title ?? "";
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(t);
   }
-  const locMap = Object.create(null);
-  for (const id of need) {
-    try {
-      const r = await fetch(`${base}/locations/${encodeURIComponent(id)}`, {
-        headers: { Authorization: token }
-      });
-      if (!r.ok) continue;
-      const txt = await r.text();
-      const d = safeParse(txt, {});
-      const name = d?.name ?? d?.locationName ?? d?.title ?? "";
-      if (name) locMap[id] = name;
-    } catch {}
-  }
-  return locMap;
 }
 
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
