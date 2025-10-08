@@ -1,149 +1,114 @@
-// Poll Chatmeter (v5) and forward each review to /api/review-webhook
+// poller-v2: echoes query params and pulls reviews using accountId/clientId/groupId
 export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
+  const VERSION = "poller-v2-2025-10-07";
+
+  // Optional: lock with CRON_SECRET
+  const want = process.env.CRON_SECRET;
+  const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
+  if (want && got !== `Bearer ${want}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized", version: VERSION });
+  }
 
   const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;  // raw token (no "Bearer")
-  const SELF_BASE = process.env.SELF_BASE_URL || ""; // e.g., https://drivo-chatmeter-bridge.vercel.app
-  const DEF_MIN   = Number(process.env.POLLER_LOOKBACK_MINUTES || 1440); // default 24h
-  const CHM_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || ""; // optional
-  const CRON_SECRET    = process.env.CRON_SECRET || "";    // optional
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;    // raw token (no "Bearer")
+  const SELF_BASE = process.env.SELF_BASE_URL;         // e.g., https://drivo-chatmeter-bridge.vercel.app
+  const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15);
 
-  const missing = [
-    !CHM_TOKEN && "CHATMETER_V5_TOKEN",
-    !SELF_BASE && "SELF_BASE_URL",
-  ].filter(Boolean);
-  if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
+  const ENV_CLIENT_ID  = process.env.CHM_CLIENT_ID  || "";
+  const ENV_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || "";
+  const ENV_GROUP_ID   = process.env.CHM_GROUP_ID   || "";
 
-  // Optional auth for Vercel Cron (if you set CRON_SECRET)
-  const hdr = req.headers?.authorization || req.headers?.Authorization || "";
-  if (CRON_SECRET && hdr !== `Bearer ${CRON_SECRET}`) {
-    return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-07" });
+  const missing = [!CHM_TOKEN && "CHATMETER_V5_TOKEN", !SELF_BASE && "SELF_BASE_URL"].filter(Boolean);
+  if (missing.length) {
+    return res.status(500).json({ ok: false, error: `Missing env: ${missing.join(", ")}`, version: VERSION });
   }
+
+  // Parse overrides: /api/poll-v2?minutes=43200&accountId=...&clientId=...&groupId=...
+  let lookback = LOOKBACK;
+  let clientId  = ENV_CLIENT_ID;
+  let accountId = ENV_ACCOUNT_ID;
+  let groupId   = ENV_GROUP_ID;
+
+  const rawUrl = req.url || "";
+  let urlMinutes = null, urlClientId = null, urlAccountId = null, urlGroupId = null;
 
   try {
-    const urlObj = new URL(req.url, "http://x");
-    const minutes = Number(urlObj.searchParams.get("minutes") || DEF_MIN);
-    const clientId  = urlObj.searchParams.get("clientId") || "";
-    const accountId = urlObj.searchParams.get("accountId") || CHM_ACCOUNT_ID;
-    const groupId   = urlObj.searchParams.get("groupId") || "";
-    const maxItems  = Number(urlObj.searchParams.get("max") || 50);
-    const sinceIso  = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+    const u = new URL(rawUrl, `https://${req.headers.host}`);
+    urlMinutes   = u.searchParams.get("minutes");
+    urlClientId  = u.searchParams.get("clientId");
+    urlAccountId = u.searchParams.get("accountId");
+    urlGroupId   = u.searchParams.get("groupId");
+    const m = Number(urlMinutes || "");
+    if (Number.isFinite(m) && m > 0) lookback = m;
+    if (urlClientId)  clientId  = urlClientId;
+    if (urlAccountId) accountId = urlAccountId;
+    if (urlGroupId)   groupId   = urlGroupId;
+  } catch {}
 
-    const q = new URLSearchParams({
-      limit: String(maxItems),
-      sortField: "reviewDate",
-      sortOrder: "DESC",
-      updatedSince: sinceIso
-    });
-    if (clientId) q.set("clientId", clientId);
-    if (accountId) q.set("accountId", accountId);
-    if (groupId) q.set("groupId", groupId);
+  const sinceIso = new Date(Date.now() - lookback * 60 * 1000).toISOString();
+  const endIso   = new Date().toISOString();
 
-    const listUrl = `${CHM_BASE}/reviews?${q.toString()}`;
-    const r = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
-    const text = await r.text();
-    if (!r.ok) return res.status(502).send(`Chatmeter list error: ${r.status} ${text}`);
+  // Build query
+  let baseQuery = `limit=50&sortField=reviewDate&sortOrder=DESC`;
+  if (clientId)  baseQuery += `&clientId=${encodeURIComponent(clientId)}`;
+  if (accountId) baseQuery += `&accountId=${encodeURIComponent(accountId)}`;
+  if (groupId)   baseQuery += `&groupId=${encodeURIComponent(groupId)}`;
 
-    const data = safeParse(text, {});
-    const items = Array.isArray(data.reviews) ? data.reviews : (data.results || []);
-    let posted = 0, skipped = 0, errors = 0;
+  // Try updatedSince, then start/end fallback
+  const url1 = `${CHM_BASE}/reviews?${baseQuery}&updatedSince=${encodeURIComponent(sinceIso)}`;
+  let items = await fetchJsonOrEmpty(url1, CHM_TOKEN);
 
-    for (const it of items) {
-      const payload = normalizeReview(it);
-      try {
-        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        if (!resp.ok) { errors++; continue; }
-        posted++;
-      } catch {
-        errors++;
-      }
-    }
-
-    return res.status(200).json({
-      ok: true,
-      version: "poller-v2-2025-10-07",
-      echo: {
-        rawUrl: urlObj.pathname + urlObj.search,
-        urlMinutes: String(minutes),
-        urlClientId: clientId || null,
-        urlAccountId: accountId || null,
-        urlGroupId: groupId || null
-      },
-      since: sinceIso,
-      lookback_minutes: minutes,
-      checked: items.length,
-      posted, skipped, errors
-    });
-  } catch (e) {
-    return res.status(500).send(`Error: ${e?.message || e}`);
+  if (!items.length) {
+    const url2 = `${CHM_BASE}/reviews?${baseQuery}&startDate=${encodeURIComponent(sinceIso)}&endDate=${encodeURIComponent(endIso)}`;
+    items = await fetchJsonOrEmpty(url2, CHM_TOKEN);
   }
+
+  let posted = 0, skipped = 0, errors = 0;
+  for (const it of items) {
+    const id = it?.id ?? it?.reviewId ?? it?.review_id ?? it?.reviewID ?? null;
+    if (!id) { skipped++; continue; }
+    const payload = {
+      id,
+      locationId: it.locationId ?? "",
+      locationName: it.locationName ?? "Unknown",
+      rating: it.rating ?? 0,
+      authorName: it.authorName ?? "Chatmeter Reviewer",
+      createdAt: it.reviewDate ?? it.createdAt ?? "",
+      text: it.text ?? "",
+      publicUrl: it.publicUrl ?? "",
+      portalUrl: it.portalUrl ?? ""
+    };
+    try {
+      const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) { errors++; continue; }
+      posted++;
+    } catch { errors++; }
+  }
+
+  return res.status(200).json({
+    ok: true,
+    version: VERSION,
+    echo: { rawUrl, urlMinutes, urlClientId, urlAccountId, urlGroupId },
+    since: sinceIso,
+    lookback_minutes: lookback,
+    used_clientId:  clientId  || null,
+    used_accountId: accountId || null,
+    used_groupId:   groupId   || null,
+    checked: items.length, posted, skipped, errors
+  });
 }
 
-/* ---------- helpers ---------- */
-
+async function fetchJsonOrEmpty(url, token) {
+  try {
+    const r = await fetch(url, { headers: { Authorization: token } }); // no "Bearer"
+    const txt = await r.text();
+    if (!r.ok) return [];
+    const data = safeParse(txt, []);
+    return Array.isArray(data) ? data : (data.results || []);
+  } catch { return []; }
+}
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
-
-function normalizeReview(r) {
-  // provider & free text extraction
-  const provider = (r.contentProvider || r.provider || "").toUpperCase();
-  const text = getReviewTextFromCM(r);
-
-  // location label from optional env map
-  let LOC_MAP = {};
-  try { if (process.env.CHM_LOCATION_MAP) LOC_MAP = JSON.parse(process.env.CHM_LOCATION_MAP); } catch {}
-  const locLabel = LOC_MAP[r.locationId] || r.locationName || "Unknown";
-
-  const author = r.reviewerUserName || r.reviewerName || "Reviewer";
-  return {
-    id: r.id,
-    provider,
-    rating: r.rating ?? 0,
-    locationId: r.locationId,
-    locationName: locLabel,
-    authorName: author,
-    createdAt: r.reviewDate || r.createdAt,
-    text,
-    publicUrl: r.reviewURL || r.publicUrl || ""
-  };
-}
-
-// provider-aware text extraction (includes Yelp branch)
-function getReviewTextFromCM(r) {
-  const provider = (r.contentProvider || r.provider || "").toUpperCase();
-  const data = Array.isArray(r.reviewData) ? r.reviewData : [];
-
-  const val = (names) => {
-    for (const n of names) {
-      const hit = data.find(
-        x => (x.name || x.fieldName || "").toLowerCase() === n.toLowerCase()
-      );
-      if (hit && hit.value) return String(hit.value);
-    }
-    return "";
-  };
-
-  let text =
-    val(["np_reviewContent", "reviewContent", "np_comment", "comment"]) ||
-    r.text ||
-    "";
-
-  if (provider === "YELP") {
-    text = val(["np_reviewText", "reviewText", "np_comment", "comment"]) || text;
-  }
-  if (provider === "GOOGLE") {
-    text = val(["np_reviewComment", "review_comment", "comment"]) || text;
-  }
-  if (provider === "TRUSTPILOT") {
-    text = val(["np_reviewText", "reviewText", "comment"]) || text;
-  }
-  if (provider === "REVIEWBUILDER") {
-    text = val(["open_text", "free_text", "comment"]) || text;
-  }
-
-  return (text || "").trim();
-}
