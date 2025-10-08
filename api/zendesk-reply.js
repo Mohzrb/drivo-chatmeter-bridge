@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN; // raw token (no "Bearer")
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN; // must be the raw token, no "Bearer "
   const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
   const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
   const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
