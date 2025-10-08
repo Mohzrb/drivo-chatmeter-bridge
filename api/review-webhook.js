@@ -27,7 +27,6 @@ module.exports = async (req, res) => {
     const publicUrl    = first(payload.publicUrl, payload.public_url, payload.url, payload.link, payload.review?.public_url, payload.review?.url, payload.payload?.public_url);
     const reviewDate   = first(payload.date, payload.review_date, payload.created_at, payload.createdAt, payload.review?.date, payload.review?.created_at, payload.payload?.review_date);
     const author       = first(payload.author, payload.reviewer, payload.review?.author, payload.payload?.author, payload.reviewer_name, "Reviewer");
-
     const text = first(
       payload.text, payload.comment, payload.content, payload.body, payload.message, payload.snippet, payload.description,
       payload.review?.text, payload.review?.comment, payload.review?.content, payload.review?.body, payload.review?.message, payload.review?.review_text,
@@ -36,7 +35,7 @@ module.exports = async (req, res) => {
 
     const subject = `${locationName} – ${rating ?? "?"}★ – ${author}`;
 
-    // HTML beige card
+    // HTML beige card (matches your screenshot)
     const html = `
 <div style="background:#fff7ee;border:1px solid #f5d6b3;border-radius:6px;padding:10px;line-height:1.45;font-family:system-ui,Segoe UI,Arial;">
   <div><strong>Review ID:</strong> ${reviewId}</div>
@@ -58,10 +57,11 @@ module.exports = async (req, res) => {
     const result = await createOrUpdateFromChatmeter({
       reviewId,
       subject,
-      htmlBody: html,  // ← send as HTML
+      htmlBody: html,
       requester: "reviews@drivo.com",
       tags: ["chatmeter","review","google"],
-      customFields
+      customFields,
+      isPublic: false   // <-- INTERNAL note (beige bubble)
     });
 
     return res.status(200).json(result);
