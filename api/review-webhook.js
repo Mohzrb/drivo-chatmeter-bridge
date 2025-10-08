@@ -1,4 +1,3 @@
-// api/review-webhook.js
 const { createOrUpdateFromChatmeter } = require("./_zd");
 const { extract, buildPlainCard } = require("./_card");
 
@@ -10,8 +9,7 @@ module.exports = async (req, res) => {
   try {
     if (req.method === "GET" && (req.query?.ping === "1" || req.query?.test === "1"))
       return res.status(200).json({ ok: true, msg: "webhook alive" });
-    if (req.method !== "POST")
-      return res.status(405).json({ error: "Method not allowed" });
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     const payload = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const { subject, data } = extract(payload);
@@ -28,16 +26,14 @@ module.exports = async (req, res) => {
     const result = await createOrUpdateFromChatmeter({
       reviewId: data.reviewId,
       subject,
-      body,                       // plain text -> beige internal note
+      body,                       // plain text -> INTERNAL beige note
       requester: "reviews@drivo.com",
       tags: ["chatmeter","review","google"],
       customFields,
       isPublic: false
     });
 
-    // Debug helper
     if (req.query?.dry === "1") return res.status(200).json({ dryRun: true, subject, body, picked: data });
-
     return res.status(200).json(result);
   } catch (e) {
     const detail = e?.response?.data || e?.message || e?.stack || String(e);
