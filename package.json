@@ -2,7 +2,7 @@
   "name": "drivo-chatmeter-bridge",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": ">=20" },
+  "type": "commonjs",
   "scripts": {
     "build": "echo \"Vercel builds serverless functions automatically\""
   }
