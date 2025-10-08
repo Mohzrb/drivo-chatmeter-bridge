@@ -1,105 +1,133 @@
-// Chatmeter → Zendesk (create ticket)
+// api/review-webhook.js
+// Chatmeter → Zendesk (idempotent via external_id)
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const {
-    ZENDESK_SUBDOMAIN,
-    ZENDESK_EMAIL,
-    ZENDESK_API_TOKEN,
-    ZD_FIELD_REVIEW_ID,
-    ZD_FIELD_LOCATION_ID,
-    ZD_FIELD_RATING,
-    ZD_FIELD_FIRST_REPLY_SENT,
-    ZD_FIELD_LOCATION_NAME,       // optional
-    CHM_LOCATION_MAP              // optional JSON mapping { "1001":"JFK", ... }
-  } = process.env;
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
+  const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
+  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
+
+  const ZD_FIELD_REVIEW_ID        = process.env.ZD_FIELD_REVIEW_ID;        // 35430266638231
+  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;      // 35440761054615
+  const ZD_FIELD_RATING           = process.env.ZD_FIELD_RATING;           // 35440783828759
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // 35430318419351
+  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME;    // (optional)
 
   const missing = [
-    !ZENDESK_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
-    !ZENDESK_EMAIL && "ZENDESK_EMAIL",
-    !ZENDESK_API_TOKEN && "ZENDESK_API_TOKEN"
+    !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
+    !ZD_EMAIL && "ZENDESK_EMAIL",
+    !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
   ].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
-  const auth = "Basic " + Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString("base64");
-
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const reviewId     = body.id || body.reviewId || body.review_id;
+    if (!reviewId) return res.status(400).send("Missing review id");
 
-    // canonical payload we expect:
-    // { id, locationId, locationName, rating, authorName, createdAt, text, publicUrl, portalUrl, provider }
-    const reviewId     = String(body.id || body.reviewId || "");
-    const locationId   = body.locationId ? String(body.locationId) : "";
-    const rating       = typeof body.rating === "number" ? body.rating : Number(body.rating || 0);
-    const authorName   = body.authorName || "Chatmeter Reviewer";
-    const createdAt    = body.createdAt || "";
-    const publicUrl    = body.publicUrl || body.reviewURL || "";
-    const portalUrl    = body.portalUrl || "";
-    const provider     = (body.provider || "").toUpperCase();
+    const locationId   = body.locationId ?? "";
+    const locationName = body.locationName ?? "";
+    const rating       = body.rating ?? 0;
+    const authorName   = body.authorName ?? "Chatmeter Reviewer";
+    const createdAt    = body.createdAt ?? "";
+    const text         = body.text ?? "";
+    const publicUrl    = body.publicUrl ?? body.reviewURL ?? "";
+    const provider     = body.provider || body.contentProvider || "";
 
-    // Location name preference: explicit payload → mapping → fallback
-    let map = {};
-    try { map = CHM_LOCATION_MAP ? JSON.parse(CHM_LOCATION_MAP) : {}; } catch {}
-    const mappedName = map[locationId] || null;
-    const locationName = body.locationName || mappedName || "Unknown";
-
-    // Human friendly subject
-    const subject = `${locationName} – ${rating}★ – ${authorName}`;
-
-    // Ticket body
+    // Subject + description
+    const subject = `${locationName || locationId || "Unknown"} – ${rating}★ – ${authorName}`.trim();
     const description = [
-      "Update from Chatmeter bridge",
-      "",
       `Review ID: ${reviewId}`,
-      `Provider: ${provider || "N/A"}`,
-      `Location: ${locationName}${locationId ? "" : ""}`,
-      `Rating: ${rating || "N/A"}★`,
+      `Provider: ${provider || "Unknown"}`,
+      `Location: ${locationName || "(name unknown)"} (${locationId || "-"})`,
+      `Rating: ${rating}★`,
       createdAt ? `Date: ${createdAt}` : "",
       "",
       "Review Text:",
-      (body.text && String(body.text).trim()) ? String(body.text).trim() : "(no text)",
+      text || "(no text)",
       "",
       "Links:",
       publicUrl ? `Public URL: ${publicUrl}` : "",
-      portalUrl ? `Chatmeter URL: ${portalUrl}` : ""
     ].filter(Boolean).join("\n");
 
-    const ticket = {
+    const auth = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
+
+    // ---------- DEDUPE VIA external_id ----------
+    const externalId = `chatmeter:${reviewId}`;
+
+    // Fast lookup by external_id
+    const showMany = await fetch(
+      `https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`,
+      { headers: { Authorization: "Basic " + auth } }
+    );
+    const showJson = await showMany.json().catch(() => ({}));
+    const existingId = showJson?.tickets?.[0]?.id;
+
+    // Custom fields (create or update)
+    const custom_fields = [];
+    if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID,        value: String(reviewId) });
+    if (ZD_FIELD_LOCATION_ID)      custom_fields.push({ id: +ZD_FIELD_LOCATION_ID,      value: String(locationId || "") });
+    if (ZD_FIELD_RATING)           custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating || 0 });
+    if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
+    if (ZD_FIELD_LOCATION_NAME && locationName)
+      custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: String(locationName) });
+
+    // Shared tags
+    const tags = ["chatmeter", "review", `cm_provider_${(provider || "unknown").toLowerCase()}`];
+
+    if (existingId) {
+      // ---------- Update existing ticket (no duplicate) ----------
+      const upd = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets/${existingId}.json`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Basic " + auth
+        },
+        body: JSON.stringify({
+          ticket: {
+            subject, // keep it fresh
+            tags,
+            custom_fields,
+            comment: {
+              body: "Chatmeter update received (dedupe – no new ticket).",
+              public: false
+            }
+          }
+        })
+      });
+      if (!upd.ok) {
+        const et = await upd.text();
+        return res.status(207).send(`OK (deduped) but update failed: ${upd.status} ${et}`);
+      }
+      return res.status(200).json({ ok: true, deduped: true, ticketId: existingId });
+    }
+
+    // ---------- Create new ticket (with external_id) ----------
+    const createPayload = {
       ticket: {
+        external_id: externalId,
         subject,
-        // creation message = internal note (like your “Google 5-Star Review” layout)
-        comment: { body: description, public: false },
+        comment: { body: description, public: true },
         requester: { name: authorName, email: "reviews@drivo.com" },
-        tags: ["chatmeter", "review", "inbound", provider.toLowerCase()].filter(Boolean)
+        tags,
+        custom_fields
       }
     };
 
-    // custom fields
-    const custom_fields = [];
-    if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID, value: reviewId });
-    if (ZD_FIELD_LOCATION_ID && locationId) custom_fields.push({ id: +ZD_FIELD_LOCATION_ID, value: locationId });
-    if (ZD_FIELD_RATING && rating) custom_fields.push({ id: +ZD_FIELD_RATING, value: rating });
-    if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
-    if (ZD_FIELD_LOCATION_NAME && locationName && !mappedName) {
-      // If you want to store the friendly name (JFK/EWR/…), set this field id
-      custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName });
-    }
-    if (custom_fields.length) ticket.ticket.custom_fields = custom_fields;
-
-    const zdRes = await fetch(`https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
+    const create = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": auth },
-      body: JSON.stringify(ticket)
+      headers: { "Content-Type": "application/json", "Authorization": "Basic " + auth },
+      body: JSON.stringify(createPayload)
     });
+    const createTxt = await create.text();
+    if (!create.ok) return res.status(502).send(`Zendesk create error: ${create.status} ${createTxt}`);
 
-    if (!zdRes.ok) {
-      const errTxt = await zdRes.text();
-      return res.status(502).send(`Zendesk error: ${zdRes.status} ${errTxt}`);
-    }
-
-    const data = await zdRes.json();
-    res.status(200).json({ ok: true, createdTicketId: data?.ticket?.id ?? null });
+    const created = safeParse(createTxt, {});
+    return res.status(200).json({ ok: true, createdTicketId: created?.ticket?.id ?? null });
   } catch (e) {
-    res.status(500).send(`Error: ${e?.message || e}`);
+    return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
+
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
