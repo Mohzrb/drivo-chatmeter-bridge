@@ -1,150 +1,87 @@
-// Poll Chatmeter for recent reviews and forward each to /api/review-webhook
+// Poll Chatmeter for recent reviews and forward to /api/review-webhook
 export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
-
-  const {
-    CHATMETER_V5_BASE = "https://live.chatmeter.com/v5",
-    CHATMETER_V5_TOKEN,
-    CHM_ACCOUNT_ID,
-    CHM_LOCATION_MAP,
-    SELF_BASE_URL,
-    CRON_SECRET
-  } = process.env;
-
-  const version = "poller-v2-ultradeep-2025-10-08";
-
-  // Protect with CRON_SECRET if present
-  const gotAuth = req.headers.authorization || req.headers.Authorization || "";
-  if (CRON_SECRET && gotAuth !== `Bearer ${CRON_SECRET}`) {
-    return res.status(401).json({ ok: false, error: "Unauthorized", version });
+  // Require CRON_SECRET (Vercel Cron sends Authorization: Bearer <CRON_SECRET>)
+  const want = process.env.CRON_SECRET || "";
+  const got  = req.headers?.authorization || req.headers?.Authorization || "";
+  if (want && got !== `Bearer ${want}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-08" });
   }
-  if (!CHATMETER_V5_TOKEN) return res.status(500).send("Missing env: CHATMETER_V5_TOKEN");
 
-  // Parse query
-  const urlObj = new URL(req.url, "http://localhost");
-  const q = Object.fromEntries(urlObj.searchParams.entries());
+  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;          // raw token (no "Bearer")
+  const SELF_BASE = process.env.SELF_BASE_URL;               // e.g., https://drivo-chatmeter-bridge.vercel.app
+  const LOC_MAP   = parseJSON(process.env.LOCATION_MAP_JSON || "{}", {}); // {"1001892551":"JFK",...}
 
-  // New: single-review debugging
-  const singleId  = (q.id || "").trim();
-
-  const minutes   = Number(q.minutes || q.m || 15);
-  const clientId  = (q.clientId || "").trim();
-  const accountId = (q.accountId || CHM_ACCOUNT_ID || "").trim();
-  const groupId   = (q.groupId || "").trim();
-  const providers = (q.providers || "").trim();        // e.g. GOOGLE,YELP
-  const maxItems  = Math.min(Number(q.max || 50), 50); // safety cap
-  const dryRun    = q.dry === "1" || q.dry === "true";
-  const wantDebug = q.debug === "1" || q.debug === "true";
-
-  const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
-  const BASE = CHATMETER_V5_BASE;
-  const TOKEN = CHATMETER_V5_TOKEN;
-
-  const host = SELF_BASE_URL || `https://${req.headers.host}`;
-  const forwardTo = `${host}/api/review-webhook`;
-
-  // Providers for which we always pull detail
-  const ALWAYS_DETAIL = new Set(["GOOGLE", "YELP", "TRUSTPILOT", "FACEBOOK", "BING", "MICROSOFT"]);
-
-  let LOCATION_MAP = {};
-  try { LOCATION_MAP = CHM_LOCATION_MAP ? JSON.parse(CHM_LOCATION_MAP) : {}; } catch {}
-
-  // Helper to fetch JSON safely
-  const fetchJson = async (url) => {
-    const r = await fetch(url, { headers: { Authorization: TOKEN } });
-    const t = await r.text();
-    return { ok: r.ok, status: r.status, text: t, json: safeParse(t, {}) };
-  };
+  if (!CHM_TOKEN) return res.status(500).json({ ok: false, error: "Missing CHATMETER_V5_TOKEN" });
+  if (!SELF_BASE) return res.status(500).json({ ok: false, error: "Missing SELF_BASE_URL" });
 
   try {
-    let items = [];
-    let listUrl = "";
-    let listRaw = "";
+    const url = new URL(req.url, "http://localhost");
+    const minutes   = toInt(url.searchParams.get("minutes"), 15);
+    const dry       = url.searchParams.get("dry") === "1";
+    const maxItems  = toInt(url.searchParams.get("max"), 50);
+    const clientId  = strOrEmpty(url.searchParams.get("clientId") || process.env.CHM_CLIENT_ID);
+    const accountId = strOrEmpty(url.searchParams.get("accountId") || process.env.CHM_ACCOUNT_ID);
+    const groupId   = strOrEmpty(url.searchParams.get("groupId") || process.env.CHM_GROUP_ID);
 
-    if (singleId) {
-      // ----- single review mode
-      const det = await fetchJson(`${BASE}/reviews/${encodeURIComponent(singleId)}`);
-      if (!det.ok) return res.status(502).send(`Chatmeter detail error: ${det.status} ${det.text}`);
-      items = [det.json];
-      listUrl = `${BASE}/reviews/${singleId}`;
-      listRaw = det.text;
-    } else {
-      // ----- list mode
-      const params = new URLSearchParams({
-        limit: String(maxItems),
-        sortField: "reviewDate",
-        sortOrder: "DESC",
-        updatedSince: sinceIso
-      });
-      if (clientId)  params.set("clientId", clientId);
-      if (accountId) params.set("accountId", accountId);
-      if (groupId)   params.set("groupId", groupId);
-      if (providers) params.set("providers", providers);
+    const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-      listUrl = `${BASE}/reviews?${params.toString()}`;
+    const params = new URLSearchParams();
+    params.set("limit", String(Math.min(50, Math.max(1, maxItems))));
+    params.set("sortField", "reviewDate");
+    params.set("sortOrder", "DESC");
+    params.set("updatedSince", sinceIso);
+    if (clientId)  params.set("clientId",  clientId);
+    if (accountId) params.set("accountId", accountId);
+    if (groupId)   params.set("groupId",   groupId);
 
-      const list = await fetchJson(listUrl);
-      if (!list.ok) return res.status(502).send(`Chatmeter list error: ${list.status} ${list.text}`);
-      listRaw = list.text;
-
-      const j = list.json;
-      items = Array.isArray(j?.reviews) ? j.reviews :
-              Array.isArray(j) ? j :
-              Array.isArray(j?.results) ? j.results : [];
+    const listUrl = `${CHM_BASE}/reviews?${params.toString()}`;
+    const first = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
+    const firstTxt = await first.text();
+    if (!first.ok) {
+      return res.status(502).json({ ok: false, error: `Chatmeter list error: ${first.status} ${firstTxt}` });
     }
 
-    let posted = 0, skipped = 0, errors = 0;
-    const debugMissing = [];
+    // Chatmeter can return {reviews:[...]} or raw array
+    const parsed = safeParse(firstTxt, {});
+    const items = Array.isArray(parsed) ? parsed
+                : Array.isArray(parsed.reviews) ? parsed.reviews
+                : Array.isArray(parsed.results) ? parsed.results
+                : [];
 
-    for (const r of items) {
-      const id = r?.id || r?.reviewId || r?.review_id;
+    let posted = 0, skipped = 0, errors = 0;
+    const toProcess = items.slice(0, maxItems);
+
+    for (const it of toProcess) {
+      const id = it?.id || it?.reviewId || it?.review_id || null;
       if (!id) { skipped++; continue; }
 
-      let provider = String(r.contentProvider || r.provider || r.source || "").toUpperCase();
-      if (provider.includes("MICROSOFT")) provider = "BING";
+      const rating     = toInt(it?.rating, 0);
+      const provider   = (it?.contentProvider || it?.provider || "").toString().toUpperCase();
+      const reviewDate = it?.reviewDate || it?.createdAt || "";
+      const author     = it?.reviewerUserName || it?.authorName || "Chatmeter Reviewer";
+      const reviewURL  = it?.reviewURL || it?.publicUrl || "";
+      const locationId = it?.locationId ? String(it.locationId) : "";
+      const locationName = LOC_MAP[locationId] || it?.locationName || "Unknown";
 
-      // Step 1: try text from list object
-      let text = extractText(r);
-
-      // Step 2: detail fetch when needed
-      if (!text || ALWAYS_DETAIL.has(provider)) {
-        try {
-          const det = await fetchJson(`${BASE}/reviews/${encodeURIComponent(id)}`);
-          if (det.ok) {
-            text = extractText(det.json) || text;
-            // If still nothing, capture a small debug blob (on demand)
-            if (!text && wantDebug && debugMissing.length < 3) {
-              debugMissing.push({
-                id, provider,
-                keys: Object.keys(det.json || {}).slice(0, 20),
-                sample: stringifyShort(det.json, 1600)
-              });
-            }
-          }
-        } catch { /* ignore */ }
-      }
-
-      // Some reviews are truly rating-only; if text is blank after deep search we accept "(no text)"
-      const locationId   = String(r.locationId || r.location_id || "");
-      const locationName = LOCATION_MAP[locationId] || r.locationName || r.location || "Unknown";
+      const text = pickText(it);
 
       const payload = {
-        id,
-        provider,
+        id: String(id),
         locationId,
         locationName,
-        rating: typeof r.rating === "number" ? r.rating : Number(r.rating || 0),
-        authorName: r.reviewerUserName || r.authorName || r.reviewer || "Chatmeter Reviewer",
-        createdAt: r.reviewDate || r.createdAt || r.date || "",
-        text: text || "",
-        publicUrl: r.reviewURL || r.publicUrl || "",
-        portalUrl: r.portalUrl || ""
+        rating,
+        authorName: author,
+        createdAt: reviewDate,
+        text,
+        publicUrl: reviewURL,
+        provider
       };
 
-      if (dryRun) { posted++; continue; }
+      if (dry) { posted++; continue; }
 
       try {
-        const resp = await fetch(forwardTo, {
+        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -158,108 +95,52 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      version,
+      version: "poller-v2-2025-10-08",
       echo: {
-        rawUrl: `/api/poll-v2?${new URLSearchParams(q).toString()}`,
-        minutes, clientId, accountId, groupId, dry: dryRun, maxItems,
-        singleId: singleId || null
+        rawUrl: req.url,
+        minutes,
+        clientId:  clientId || "",
+        accountId: accountId || "",
+        groupId:   groupId || "",
+        dry,
+        maxItems
       },
       since: sinceIso,
-      checked: items.length,
+      checked: toProcess.length,
       posted, skipped, errors,
-      debug: wantDebug ? { url: listUrl, body_snippet: listRaw.slice(0, 300), missing: debugMissing } : undefined
+      debug: { url: listUrl, body_snippet: (firstTxt || "").slice(0, 240) }
     });
   } catch (e) {
-    return res.status(500).send(`Error: ${e?.message || e}`);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
 
-// ----------------- helpers -----------------
-
+// ---- helpers ----
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+function parseJSON(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+function toInt(v, d = 0) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+function strOrEmpty(v) { return v ? String(v) : ""; }
 
-// Human-like string test
-function looksLikeHumanText(str) {
-  if (!str || typeof str !== "string") return false;
-  const s = str.trim();
-  if (s.length < 15) return false;                  // too short to be a comment
-  if (/^https?:\/\//i.test(s)) return false;        // url
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return false;  // iso date
-  if (/^[A-F0-9\-]{20,}$/i.test(s)) return false;   // id-like
-  // needs spaces and letters
-  if (!/[a-z]/i.test(s) || !/\s/.test(s)) return false;
-  return true;
-}
+function pickText(it) {
+  // 1) obvious fields
+  const direct = it?.text || it?.reviewText || it?.content || "";
+  if (direct) return String(direct);
 
-// Deep search through any object for best comment candidate
-function deepSearchForText(obj, preferKeyHint = false) {
-  let best = "";
-  const visit = (node, key = "") => {
-    if (!node) return;
-    if (typeof node === "string") {
-      if (looksLikeHumanText(node)) {
-        if (preferKeyHint) {
-          // slightly prefer strings coming from commentish keys
-          if (node.length >= best.length || /comment|text|review|feedback|message/i.test(key)) best = node.trim();
-        } else {
-          if (node.length > best.length) best = node.trim();
-        }
-      }
-      return;
+  // 2) reviewData array from Chatmeter v5
+  const rd = Array.isArray(it?.reviewData) ? it.reviewData : [];
+  const get = (names) => {
+    for (const name of names) {
+      const f = rd.find(x => (x?.name || "").toLowerCase() === name);
+      if (f?.value) return String(f.value);
     }
-    if (Array.isArray(node)) {
-      for (const v of node) visit(v, key);
-      return;
-    }
-    if (typeof node === "object") {
-      for (const [k, v] of Object.entries(node)) visit(v, k);
-    }
+    return "";
   };
-  visit(obj);
-  return best;
-}
 
-// Extract text using a layering strategy
-function extractText(o) {
-  if (!o || typeof o !== "object") return "";
+  // Try common keys used by Chatmeter / providers
+  const text =
+    get(["review_text", "reviewtext", "review_content", "content", "comment", "comments"]) ||
+    get(["nps_comment", "np_comment", "np_content_1", "free_text", "freeText"]) ||
+    "";
 
-  const pick = (v) => (typeof v === "string" && v.trim()) ? v.trim() : "";
-  // 1) common direct keys
-  for (const k of ["text","comment","body","reviewText","review_text","description","message","content"]) {
-    const v = pick(o[k]);
-    if (looksLikeHumanText(v)) return v;
-  }
-  // 2) nested 'review'
-  if (o.review) {
-    for (const k of ["text","comment","body","description","message"]) {
-      const v = pick(o.review[k]);
-      if (looksLikeHumanText(v)) return v;
-    }
-  }
-  // 3) survey/reviewBuilder: reviewData[{name|label,value}]
-  if (Array.isArray(o.reviewData)) {
-    const hit = o.reviewData.find(x =>
-      x && /comment|text|review|feedback|message/i.test(String(x.name||x.label||""))
-    );
-    const v = pick(hit?.value);
-    if (looksLikeHumanText(v)) return v;
-    // else try any long-ish value in reviewData
-    for (const x of o.reviewData) {
-      const vv = pick(x?.value);
-      if (looksLikeHumanText(vv)) return vv;
-    }
-  }
-  // 4) deep recursive catch-all (prefers commentish keys)
-  const hinted = deepSearchForText(o, true);
-  if (hinted) return hinted;
-
-  // 5) last resort: longest human-like string anywhere
-  return deepSearchForText(o, false);
-}
-
-function stringifyShort(obj, maxLen = 1200) {
-  let s = "";
-  try { s = JSON.stringify(obj); } catch {}
-  if (s.length > maxLen) s = s.slice(0, maxLen) + "…";
-  return s;
+  return text;
 }
