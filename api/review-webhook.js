@@ -1,16 +1,24 @@
-// Chatmeter → Zendesk (create ticket, idempotent)
+// api/review-webhook.js
+// Chatmeter → Zendesk (create ticket with internal "Review Information" note)
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
+  // ---- env
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;   // drivohelp
   const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
   const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
 
   const ZD_FIELD_REVIEW_ID        = process.env.ZD_FIELD_REVIEW_ID;        // text
-  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;      // text/dropdown
+  const ZD_FIELD_LOCATION_ID      = process.env.ZD_FIELD_LOCATION_ID;      // text/number
   const ZD_FIELD_RATING           = process.env.ZD_FIELD_RATING;           // number
   const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT; // checkbox
-  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME;    // optional text/dropdown
+  const ZD_FIELD_LOCATION_NAME    = process.env.ZD_FIELD_LOCATION_NAME;    // (optional) text/tagger
+
+  let LOCATION_MAP = {};
+  try {
+    if (process.env.LOCATION_MAP_JSON) LOCATION_MAP = JSON.parse(process.env.LOCATION_MAP_JSON);
+  } catch {}
 
   const missing = [
     !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
@@ -19,131 +27,160 @@ export default async function handler(req, res) {
   ].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
-  const authBasic = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
-  const Z = async (path, init = {}) => {
-    const r = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com${path}`, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": `Basic ${authBasic}`,
-        ...(init.headers || {})
-      }
-    });
-    const text = await r.text();
-    return { ok: r.ok, status: r.status, text, json: safeParse(text, {}) };
+  // ---- parse incoming review
+  let body = {};
+  try {
+    body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+  } catch (e) {
+    return res.status(400).send("Invalid JSON body");
+  }
+
+  // Canonicalize fields we care about (across providers)
+  const reviewId      = body.id || body.reviewId || body.review_id || "";
+  const rating        = coerceNumber(body.rating);
+  const provider      = (body.provider || body.contentProvider || "").toString().trim() || "CHATMETER";
+  const rawLocId      = (body.locationId || "").toString();
+  const mappedLabel   = LOCATION_MAP[rawLocId];   // e.g. "LGA004 – LaGuardia Airport"
+  const locationName  = body.locationName || mappedLabel || "Unknown";
+  const createdAt     = body.createdAt || body.reviewDate || new Date().toISOString();
+  const authorName    = pickFirst(body.authorName, body.reviewerUserName, "Customer");
+  const authorEmail   = pickFirst(body.reviewerEmail, body.email, "");      // may be blank
+  const authorPhone   = pickFirst(body.reviewerPhone, body.phone, "");      // may be blank
+  const publicUrl     = body.publicUrl || body.reviewURL || "";
+  const text =
+    body.text ||
+    extractReviewTextFromData(body.reviewData) ||
+    ""; // might be blank for some providers
+
+  if (!reviewId) return res.status(400).send("Missing review id");
+
+  // ---- compose subject (clean & short)
+  const subject = `${provider.toUpperCase()} ${rating || "–"}★ – ${shorten(locationName)}`;
+
+  // ---- "Review Information" internal note (exact layout)
+  const internalNote = [
+    "Review Information:",
+    "",
+    `Date: ${createdAt}`,
+    "",
+    `Customer: ${authorName}`,
+    authorEmail ? `${authorEmail}` : "",
+    authorPhone ? `${authorPhone}` : "",
+    "",
+    `Location: ${locationName}`,
+    "",
+    "Comment:",
+    text || "(no text)",
+    "",
+    "The first comment on this ticket will be recorded as your response to Chatmeter. Any messages after will not be",
+    "sent and you can work the ticket as normal"
+  ].filter(Boolean).join("\n");
+
+  // ---- Zendesk auth
+  const auth = "Basic " + Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
+  const zBase = `https://${ZD_SUBDOMAIN}.zendesk.com`;
+
+  // ---- dedupe via external_id search
+  const externalId = `chatmeter:${reviewId}`;
+
+  const foundId = await findTicketByExternalId(zBase, auth, externalId);
+  if (foundId) {
+    // Already exists → do NOT create a new ticket
+    return res.status(200).json({ ok: true, deduped: true, via: "lookup", ticketId: foundId });
+  }
+
+  // ---- custom_fields
+  const custom_fields = [];
+  if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID,        value: String(reviewId) });
+  if (ZD_FIELD_LOCATION_ID)      custom_fields.push({ id: +ZD_FIELD_LOCATION_ID,      value: String(rawLocId || "") });
+  if (ZD_FIELD_RATING && rating) custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating });
+  if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
+  if (ZD_FIELD_LOCATION_NAME && locationName) {
+    custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: String(locationName) });
+  }
+
+  // ---- build ticket payload
+  const ticket = {
+    ticket: {
+      subject,
+      external_id: externalId,
+      requester: { name: "Chatmeter", email: "reviews@drivo.com" },  // keeps all bridge tickets tied to a neutral user
+      tags: ["chatmeter", "review", provider.toLowerCase()],
+      comment: {
+        body: internalNote,
+        public: false // <-- INTERNAL NOTE like your screenshot
+      },
+      custom_fields
+    }
   };
 
-  try {
-    const b = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const reviewIdRaw = b.id || b.reviewId || b.review_id;
-    const reviewId = reviewIdRaw ? String(reviewIdRaw).trim() : "";
-    if (!reviewId) return res.status(400).send("Missing review id");
+  // idempotency header (second hit with same reviewId still won’t create)
+  const idempKey = `chatmeter:${reviewId}`;
 
-    const locationId   = toStr(b.locationId);
-    const locationName = toStr(b.locationName) || "Unknown";
-    const rating       = toNum(b.rating, 0);
-    const authorName   = toStr(b.authorName) || "Chatmeter Reviewer";
-    const createdAt    = toStr(b.createdAt);
-    const text         = toStr(b.text || b.comment || b.reviewText);
-    const publicUrl    = toStr(b.publicUrl || b.reviewURL);
-    const provider     = toStr(b.provider || b.contentProvider).toUpperCase();
+  // ---- create ticket
+  const createRes = await fetch(`${zBase}/api/v2/tickets.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": auth,
+      "Idempotency-Key": idempKey
+    },
+    body: JSON.stringify(ticket)
+  });
 
-    const externalId = `chatmeter:${reviewId}`;
-    const uniqueTag  = `cmrvw_${reviewId.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 60)}`;
-
-    // ---------- LOOKUP ----------
-    // Try show_many first (no search index lag). If non-OK, fall back to search.
-    let foundTicketId = null;
-    {
-      const lookup = await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
-      if (lookup.ok) {
-        const t = lookup.json?.tickets?.[0];
-        if (t?.id) foundTicketId = t.id;
-      }
-    }
-    if (!foundTicketId) {
-      const q = encodeURIComponent(`type:ticket external_id:"${externalId}"`);
-      const sr = await Z(`/api/v2/search.json?query=${q}&per_page=1`);
-      if (sr.ok && Array.isArray(sr.json?.results) && sr.json.results[0]?.id) {
-        foundTicketId = sr.json.results[0].id;
-      }
-    }
-
-    if (foundTicketId) {
-      // Light touch (no noisy notes)
-      await lightTouch(foundTicketId, Z);
-      return res.status(200).json({ ok: true, deduped: true, via: "lookup", ticketId: foundTicketId });
-    }
-
-    // ---------- CREATE ----------
-    const subject = `${locationName} – ${rating}★ – ${authorName}`;
-    const description = [
-      `Review ID: ${reviewId}`,
-      `Provider: ${provider || "N/A"}`,
-      `Location: ${locationName}${locationId ? ` (${locationId})` : ""}`,
-      `Rating: ${rating}★`,
-      createdAt ? `Date: ${createdAt}` : "",
-      "",
-      "Review Text:",
-      text || "(no text)",
-      "",
-      "Public URL:",
-      publicUrl || "(none)"
-    ].filter(Boolean).join("\n");
-
-    const custom_fields = [];
-    if (ZD_FIELD_REVIEW_ID)        custom_fields.push({ id: +ZD_FIELD_REVIEW_ID,        value: reviewId });
-    if (ZD_FIELD_LOCATION_ID)      custom_fields.push({ id: +ZD_FIELD_LOCATION_ID,      value: locationId });
-    if (ZD_FIELD_RATING)           custom_fields.push({ id: +ZD_FIELD_RATING,           value: rating });
-    if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
-    if (ZD_FIELD_LOCATION_NAME && locationName) {
-      custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName });
-    }
-
-    const create = await Z(`/api/v2/tickets.json`, {
-      method: "POST",
-      headers: { "Idempotency-Key": externalId }, // collapse near-simultaneous creates
-      body: JSON.stringify({
-        ticket: {
-          external_id: externalId,
-          subject,
-          comment: { body: description, public: true }, // public first message to avoid internal-note spam
-          requester: { name: authorName, email: "reviews@drivo.com" },
-          custom_fields,
-          tags: ["chatmeter", "review", uniqueTag, provider.toLowerCase()].filter(Boolean)
-        }
-      })
-    });
-
-    if (!create.ok) {
-      return res.status(502).send(`Zendesk create error: ${create.status} ${create.text}`);
-    }
-
-    const createdId = create.json?.ticket?.id ?? null;
-
-    // warm-up show_many so subsequent calls see it immediately
-    await Z(`/api/v2/tickets/show_many.json?external_ids=${encodeURIComponent(externalId)}`);
-
-    return res.status(200).json({ ok: true, createdTicketId: createdId });
-  } catch (e) {
-    return res.status(500).send(`Error: ${e?.message || e}`);
+  if (!createRes.ok) {
+    const errTxt = await createRes.text();
+    return res.status(502).send(`Zendesk create error: ${createRes.status} ${errTxt}`);
   }
+
+  const data = await createRes.json();
+  return res.status(200).json({ ok: true, createdTicketId: data?.ticket?.id ?? null });
 }
 
-async function lightTouch(ticketId, Z) {
-  try {
-    await Z(`/api/v2/tickets/${ticketId}.json`, {
-      method: "PUT",
-      body: JSON.stringify({
-        ticket: {
-          tags: ["chatmeter", "review", "deduped"]
-        }
-      })
-    });
-  } catch { /* ignore */ }
+// --------------------------------- helpers
+function pickFirst(...vals) {
+  for (const v of vals) if (v && String(v).trim()) return String(v).trim();
+  return "";
 }
 
-function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
-function toStr(v) { return (v === null || v === undefined) ? "" : String(v); }
-function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+function coerceNumber(n) {
+  if (n === 0 || n === "0") return 0;
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
+}
+
+function shorten(s = "", max = 60) {
+  s = String(s); 
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+// Chatmeter Survey/Google payloads sometimes place text in reviewData array
+function extractReviewTextFromData(arr) {
+  if (!Array.isArray(arr)) return "";
+  // try common keys in order
+  const keys = ["comment", "text", "review", "message", "body", "freeText"];
+  for (const row of arr) {
+    if (!row) continue;
+    // name/value style
+    if (row.value && typeof row.value === "string" && row.name) {
+      const name = String(row.name).toLowerCase();
+      if (keys.some(k => name.includes(k)) && row.value.trim()) return row.value.trim();
+    }
+    // direct key/value style
+    for (const k of keys) {
+      if (typeof row[k] === "string" && row[k].trim()) return row[k].trim();
+    }
+  }
+  return "";
+}
+
+async function findTicketByExternalId(zBase, auth, externalId) {
+  // Zendesk search: type:ticket external_id:"chatmeter:xxxx"
+  const q = encodeURIComponent(`type:ticket external_id:"${externalId}"`);
+  const url = `${zBase}/api/v2/search.json?query=${q}`;
+  const r = await fetch(url, { headers: { Authorization: auth, Accept: "application/json" } });
+  if (!r.ok) return null;
+  const js = await r.json();
+  const first = (js?.results || []).find(r => r?.external_id === externalId);
+  return first?.id || null;
+}
