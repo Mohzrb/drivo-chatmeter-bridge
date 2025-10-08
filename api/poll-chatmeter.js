@@ -1,40 +1,61 @@
-// Poll Chatmeter for recent/updated reviews and create Zendesk tickets
 export default async function handler(req, res) {
-  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
-  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-  const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
-  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-
-  if (!CHM_TOKEN) return res.status(500).send("Missing CHATMETER_V5_TOKEN");
-
-  // Pull “recently updated” – adjust window as you like
-  const since = new Date(Date.now() - 15 * 60 * 1000).toISOString(); // last 15 minutes
-  const url = `${CHM_BASE}/reviews?updatedSince=${encodeURIComponent(since)}&sortField=reviewDate&sortOrder=DESC`;
-
   try {
-    const list = await fetch(url, { headers: { "Authorization": CHM_TOKEN }});
-    if (!list.ok) return res.status(502).send(`Chatmeter list error: ${list.status} ${await list.text()}`);
-    const data = await list.json();
+    const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;            // raw token (no "Bearer")
+    const SELF_BASE = process.env.SELF_BASE_URL;                  // e.g. https://drivo-chatmeter-bridge.vercel.app
+    const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15); // default 15 minutes
 
-    // For each review, call our existing ticket creator internally
-    let created = 0;
-    for (const r of (data?.results || data || [])) {
+    const miss = [
+      !CHM_TOKEN && "CHATMETER_V5_TOKEN",
+      !SELF_BASE && "SELF_BASE_URL",
+    ].filter(Boolean);
+    if (miss.length) return res.status(500).send(`Missing env: ${miss.join(", ")}`);
+
+    // since = now - lookback (a small overlap is OK to avoid gaps)
+    const since = new Date(Date.now() - LOOKBACK * 60 * 1000).toISOString();
+
+    const url = `${CHM_BASE}/reviews?updatedSince=${encodeURIComponent(since)}&limit=50&sortField=reviewDate&sortOrder=DESC`;
+    const r = await fetch(url, { headers: { Authorization: CHM_TOKEN } });
+
+    const txt = await r.text();
+    if (!r.ok) return res.status(502).send(`Chatmeter list error: ${r.status} ${txt}`);
+    const data = safeParse(txt, []);
+    const items = Array.isArray(data) ? data : (data.results || []);
+
+    let posted = 0, errors = 0;
+    for (const it of items) {
       const payload = {
-        id: r.id, locationId: r.locationId, locationName: r.locationName,
-        rating: r.rating, authorName: r.authorName, createdAt: r.reviewDate,
-        text: r.text, publicUrl: r.publicUrl, portalUrl: r.portalUrl
+        id: it.id ?? it.reviewId ?? it.review_id,
+        locationId: it.locationId ?? "",
+        locationName: it.locationName ?? "Unknown",
+        rating: it.rating ?? 0,
+        authorName: it.authorName ?? "Chatmeter Reviewer",
+        createdAt: it.reviewDate ?? it.createdAt ?? "",
+        text: it.text ?? "",
+        publicUrl: it.publicUrl ?? "",
+        portalUrl: it.portalUrl ?? ""
       };
-      await fetch(process.env.SELF_BASE_URL + "/api/review-webhook", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      created++;
+
+      // Skip if no id
+      if (!payload.id) continue;
+
+      try {
+        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (!resp.ok) { errors++; continue; }
+        posted++;
+      } catch {
+        errors++;
+      }
     }
 
-    return res.status(200).json({ ok: true, checked: (data?.results || data || []).length, created });
+    return res.status(200).json({ ok: true, checked: items.length, posted, errors, since, lookback_minutes: LOOKBACK });
   } catch (e) {
     return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
+
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
