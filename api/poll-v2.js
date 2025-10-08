@@ -1,196 +1,141 @@
-// File: api/poll-v2.js
-// Ultra-safe Chatmeter -> Zendesk bridge poller
-// - Supports dry-run & max cap
-// - Robust survey/NPS text extraction
-// - Location name mapping via CHM_LOCATION_MAP env (JSON)
-
+// api/poll-v2.js
 export default async function handler(req, res) {
-  const VERSION = "poller-v2-ultrasafe+locmap-2025-10-07";
+  // auth for cron
+  const secret = process.env.CRON_SECRET;
+  const auth = req.headers.authorization || req.headers.Authorization || "";
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-07" });
+  }
+
+  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
+  const SELF_BASE = process.env.SELF_BASE_URL;
+  const ACCT_ENV  = process.env.CHM_ACCOUNT_ID || "";
+
+  if (!CHM_TOKEN || !SELF_BASE) {
+    return res.status(500).json({ ok: false, error: "Missing CHATMETER_V5_TOKEN or SELF_BASE_URL" });
+  }
+
+  // query params
+  const u = new URL(req.url, "https://dummy");
+  const minutes   = +(u.searchParams.get("minutes") || 20);
+  const clientId  = (u.searchParams.get("clientId") || "").trim();
+  const accountId = (u.searchParams.get("accountId") || ACCT_ENV).trim();
+  const groupId   = (u.searchParams.get("groupId") || "").trim();
+  const maxItems  = +(u.searchParams.get("max") || 50);
+  const dryRun    = ["1", "true", "yes"].includes((u.searchParams.get("dry") || "").toLowerCase());
+
+  const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+
+  // Build list URL
+  const params = new URLSearchParams({
+    limit: String(maxItems),
+    sortField: "reviewDate",
+    sortOrder: "DESC",
+    updatedSince: sinceIso
+  });
+  if (clientId)  params.set("clientId",  clientId);
+  if (accountId) params.set("accountId", accountId);
+  if (groupId)   params.set("groupId",   groupId);
+
+  const listUrl = `${CHM_BASE}/reviews?${params.toString()}`;
+
   try {
-    // Optional auth (recommended for cron)
-    const want = process.env.CRON_SECRET;
-    const got = (req.headers?.authorization || req.headers?.Authorization || "").trim();
-    if (want && got !== `Bearer ${want}`) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", version: VERSION });
-    }
-
-    // Required env
-    const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;      // raw token (no "Bearer")
-    const SELF_BASE = process.env.SELF_BASE_URL;           // e.g. https://<your-app>.vercel.app
-    if (!CHM_TOKEN || !SELF_BASE) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing env: CHATMETER_V5_TOKEN or SELF_BASE_URL",
-        version: VERSION
-      });
-    }
-
-    // Parse query
-    const baseForURL = `https://${req?.headers?.host || "x.local"}`;
-    const u = new URL(req.url || "/api/poll-v2", baseForURL);
-
-    const minutes  = Number(u.searchParams.get("minutes") || process.env.POLLER_LOOKBACK_MINUTES || 15);
-    const clientId = u.searchParams.get("clientId")  || process.env.CHM_CLIENT_ID  || "";
-    const accountId= u.searchParams.get("accountId") || process.env.CHM_ACCOUNT_ID || "";
-    const groupId  = u.searchParams.get("groupId")   || process.env.CHM_GROUP_ID   || "";
-    const dry      = ["1","true","yes","on"].includes((u.searchParams.get("dry") || "").toLowerCase());
-    const maxItems = Math.max(1, Math.min(50, Number(u.searchParams.get("max") || 50)));
-
-    const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
-
-    // Build Chatmeter URL (updatedSince)
-    let q = `limit=${maxItems}&sortField=reviewDate&sortOrder=DESC&updatedSince=${encodeURIComponent(sinceIso)}`;
-    if (clientId)  q += `&clientId=${encodeURIComponent(clientId)}`;
-    if (accountId) q += `&accountId=${encodeURIComponent(accountId)}`;
-    if (groupId)   q += `&groupId=${encodeURIComponent(groupId)}`;
-
-    const url = `${CHM_BASE}/reviews?${q}`;
-
-    // Fetch Chatmeter
-    const r = await fetch(url, { headers: { Authorization: CHM_TOKEN } });
+    const r = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
     const txt = await r.text();
     if (!r.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: `Chatmeter ${r.status}`,
-        snippet: (txt || "").slice(0, 250),
-        version: VERSION
-      });
+      return res.status(502).json({ ok: false, error: `Chatmeter list ${r.status}`, body: txt });
     }
 
-    const items = extractItems(txt);
+    const parsed = safeParse(txt, {});
+    const items  = Array.isArray(parsed?.reviews) ? parsed.reviews
+                  : Array.isArray(parsed) ? parsed
+                  : [];
 
-    // Post to our webhook (unless dry)
     let posted = 0, skipped = 0, errors = 0;
-    if (!dry) {
-      for (const it of items.slice(0, maxItems)) {
-        const payload = buildPayload(it);
-        if (!payload.id) { skipped++; continue; }
+
+    for (const it of items.slice(0, maxItems)) {
+      const id = it?.id || it?.reviewId || it?.review_id;
+      if (!id) { skipped++; continue; }
+
+      // Extract best-effort text; if empty, enrich with GET /reviews/{id}
+      let commentText = extractText(it);
+      if (!commentText) {
         try {
-          const rr = await fetch(`${SELF_BASE}/api/review-webhook`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+          const d = await fetch(`${CHM_BASE}/reviews/${encodeURIComponent(id)}`, {
+            headers: { Authorization: CHM_TOKEN }
           });
-          if (!rr.ok) { errors++; continue; }
-          posted++;
-        } catch {
-          errors++;
-        }
+          if (d.ok) {
+            const full = safeParse(await d.text(), {});
+            commentText = extractText(full?.review || full) || commentText;
+          }
+        } catch {}
       }
+
+      const payload = {
+        id,
+        contentProvider: it.contentProvider || it.provider || "",
+        locationId: it.locationId || "",
+        locationName: it.locationName || "",
+        rating: it.rating ?? 0,
+        authorName: it.reviewerUserName || it.authorName || it.userName || "Chatmeter Reviewer",
+        createdAt: it.reviewDate || it.createdAt || "",
+        text: commentText || "",
+        publicUrl: it.reviewURL || it.publicUrl || "",
+        portalUrl: it.portalUrl || ""
+      };
+
+      if (dryRun) { continue; }
+
+      try {
+        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (!resp.ok) { errors++; continue; }
+        posted++;
+      } catch { errors++; }
     }
 
     return res.status(200).json({
       ok: true,
-      version: VERSION,
-      echo: { rawUrl: req.url, minutes, clientId, accountId, groupId, dry, maxItems },
+      version: "poller-v2-ultrasafe+surveytext-2025-10-07",
+      echo: {
+        rawUrl: u.pathname + u.search,
+        minutes, clientId, accountId, groupId, dry: dryRun, maxItems
+      },
       since: sinceIso,
-      checked: items.length,
+      checked: Math.min(items.length, maxItems),
       posted, skipped, errors,
-      debug: { url, body_snippet: (txt || "").slice(0, 300) }
+      debug: { url: listUrl, body_snippet: (txt || "").slice(0, 240) }
     });
-
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      version: "poller-v2-ultrasafe+locmap-2025-10-07",
-      caught: String(e)
-    });
+    return res.status(500).json({ ok: false, error: String(e) });
   }
 }
 
-/* ---------- helpers ---------- */
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
 
-// Load static location map from env (JSON)
-function loadLocationMap() {
-  try { return JSON.parse(process.env.CHM_LOCATION_MAP || "{}"); }
-  catch { return {}; }
-}
-const LOCMAP = loadLocationMap();
+function extractText(r) {
+  const direct = [
+    r?.text, r?.reviewText, r?.comment, r?.body, r?.content, r?.description, r?.message
+  ].find(v => isNonEmpty(v));
+  if (direct) return direct;
 
-function extractItems(txt) {
-  try {
-    const data = JSON.parse(txt);
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data.results)) return data.results;
-    if (Array.isArray(data.reviews)) return data.reviews; // ReviewBuilder shape
-    if (Array.isArray(data.items))   return data.items;
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-function buildPayload(it) {
-  const id = it?.id ?? it?.reviewId ?? it?.review_id ?? it?.reviewID ?? it?.providerReviewId ?? null;
-
-  // --- Location mapping (ID -> name from CHM_LOCATION_MAP) ---
-  const locationIdRaw = it.locationId ?? it.location_id ?? it.providerLocationId ?? "";
-  const fallbackName  = it.locationName ?? it.location_name ?? it.location ?? "Unknown";
-  const mappedName    = LOCMAP[String(locationIdRaw)] || fallbackName;
-
-  const locationId   = locationIdRaw;
-  const locationName = mappedName;
-
-  const rating     = it.rating ?? it.stars ?? it.score ?? 0;
-  const authorName = it.authorName ?? it.reviewerUserName ?? it.reviewerName ?? it.author ?? "Chatmeter Reviewer";
-  const publicUrl  = it.publicUrl ?? it.reviewURL ?? it.url ?? "";
-  const createdAt  = it.reviewDate ?? it.createdAt ?? it.date ?? it.createdOn ?? "";
-  const text       = extractText(it);
-
-  return {
-    id,
-    locationId,
-    locationName,
-    rating,
-    authorName,
-    createdAt,
-    text,
-    publicUrl,
-    portalUrl: it.portalUrl ?? it.portal_url ?? ""
-  };
-}
-
-// Improved text extraction (handles survey/NPS arrays)
-function extractText(it) {
-  const isFreeText = (v) => {
-    if (v == null) return false;
-    const s = String(v).trim();
-    if (!s) return false;
-    const low = s.toLowerCase();
-    if (["n/a","na","none","null","nil","-","false","true"].includes(low)) return false;
-    if (/^\d+(\.\d+)?$/.test(s)) return false; // pure number
-    return s.length >= 3;
-  };
-
-  const out = [];
-
-  // 1) Common top-level fields
-  const fields = [
-    it.text, it.reviewText, it.content, it.comment, it.message,
-    it.detail, it.body, it.responseText, it.consumerComment
-  ];
-  for (const f of fields) if (isFreeText(f)) out.push(String(f).trim());
-
-  // 2) Survey/NPS style arrays
-  const candidates =
-    it.reviewData || it.data || it.answers || it.fields ||
-    it.surveyData || it.survey || it.response || [];
-  const rows = Array.isArray(candidates) ? candidates : [];
-
-  for (const row of rows) {
-    const val = row?.value ?? row?.answer ?? row?.text ?? row?.comment ?? "";
-    if (isFreeText(val)) out.push(String(val).trim());
-
-    const sub = row?.answers || row?.responses || row?.values;
-    if (Array.isArray(sub)) {
-      for (const a of sub) {
-        const aval = a?.value ?? a?.answer ?? a?.text ?? a?.comment ?? "";
-        if (isFreeText(aval)) out.push(String(aval).trim());
-      }
+  const arr = Array.isArray(r?.reviewData) ? r.reviewData : [];
+  for (const row of arr) {
+    const key = String(row?.name || row?.field || row?.question || "").toLowerCase();
+    const val = String(row?.value ?? row?.answer ?? row?.text ?? "").trim();
+    if (!val) continue;
+    if (key.match(/open|free|comment|word|text|describe|explain|feedback|overall/)) {
+      if (val.length > 2 && !isNumeric(val)) return val;
     }
   }
-
-  return Array.from(new Set(out)).join("\n").trim();
+  return "";
 }
+
+function isNonEmpty(x) { return typeof x === "string" && x.trim().length > 2; }
+function isNumeric(x) { return /^[\d.]+$/.test(String(x || "")); }
