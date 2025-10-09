@@ -1,5 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
+// src/integrations/providers.js  (CommonJS)
+const fs = require("node:fs");
+const path = require("node:path");
 
 let _map = null;
 
@@ -20,22 +21,27 @@ function loadProviderMap() {
   return _map;
 }
 
-export function getLocEntry(locationId) {
+function getLocEntry(locationId) {
   const m = loadProviderMap();
   return m?.[String(locationId)] || null;
 }
-export function getGlobalEntry() {
+function getGlobalEntry() {
   const m = loadProviderMap();
   return m?.DRIVO_GLOBAL || null;
 }
 
 // URL builders (link-first, compliant)
-export function yelpUrlFromAlias(alias) {
+function yelpUrlFromAlias(alias) {
   return alias ? `https://www.yelp.com/biz/${encodeURIComponent(alias)}` : null;
 }
-export function googleReviewsUrlFromConfig(entry) {
+function googleReviewsUrlFromConfig(entry) {
   return entry?.google_url || null;
 }
-export function trustpilotUrlFromConfig(entry, globalEntry) {
+function trustpilotUrlFromConfig(entry, globalEntry) {
   return entry?.trustpilot_url || globalEntry?.trustpilot_url || null;
 }
+
+module.exports = {
+  getLocEntry, getGlobalEntry,
+  yelpUrlFromAlias, googleReviewsUrlFromConfig, trustpilotUrlFromConfig
+};
