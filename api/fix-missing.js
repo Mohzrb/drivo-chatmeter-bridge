@@ -1,111 +1,109 @@
-// /api/fix-missing.js
-// Backfill missing comments by refetching Chatmeter reviews, then update tickets' fields/tags.
-// (Does NOT add an extra internal comment to avoid clutter.)
+/* -------------- robust human text extractor (v3) -------------- */
+function extractBestText(item) {
+  const candidates = [];
+  const preferred = []; // keys that look like comment/free-text
 
-export const config = { runtime: "nodejs" };
+  const pushIfGood = (raw, keyHint = "") => {
+    if (raw == null) return;
+    if (typeof raw !== "string") return;
+    const s0 = raw.trim();
+    if (!s0) return;
 
-function isGoodText(v) {
-  if (v == null) return false;
-  const s = String(v).trim();
-  if (!s) return false;
-  if (/^[a-f0-9]{24}$/i.test(s)) return false;
-  return true;
-}
-function pickTextFromReview(r) {
-  const direct = [r.text, r.reviewText, r.comment, r.body, r.content, r.message, r.review_body].find(isGoodText);
-  if (isGoodText(direct)) return String(direct).trim();
-  const rows = Array.isArray(r.reviewData) ? r.reviewData : (Array.isArray(r.data) ? r.data : []);
-  for (const it of rows) {
-    const key = String(it.name || it.key || "").toLowerCase();
-    const val = it.value ?? it.text ?? it.detail ?? "";
-    if (!isGoodText(val)) continue;
-    if (/(comment|comments|review|review[_ ]?text|text|body|content|np_comment|free.*text|description)/.test(key)) {
-      return String(val).trim();
+    // If value looks base64url, try to decode once
+    const decoded = looksLikeBase64Url(s0) ? (tryBase64UrlDecode(s0).trim() || s0) : s0;
+
+    // Hard filters: booleans, “0/1”, short tokens, control chars, no letters, etc.
+    if (!isHumanText(decoded)) return;
+
+    const hint = String(keyHint || "").toLowerCase();
+    const isPreferredKey = /(own\s*words|comment|comments|describe|review|free[_\s-]?text|feedback|explain)/i.test(hint);
+
+    (isPreferredKey ? preferred : candidates).push(decoded);
+  };
+
+  // 1) ReviewBuilder / survey pairs first (so key hints are preserved)
+  if (Array.isArray(item.reviewData)) {
+    for (const p of item.reviewData) {
+      const key = String(p?.name || "").toLowerCase();
+      const val = p?.value;
+
+      if (typeof val === "string") pushIfGood(val, key);
+      else if (val && typeof val === "object" && typeof val.value === "string") pushIfGood(val.value, key);
     }
   }
-  return "";
+
+  // 2) Common top-level fields (no key hints here)
+  [
+    item.text, item.reviewText, item.body, item.comment, item.content,
+    item.review, item.reviewerComments, item.providerReviewText,
+    item.freeText, item.free_text, item.nps_comment, item.np_comments
+  ].forEach(v => pushIfGood(v));
+
+  // 3) Other survey shapes
+  if (Array.isArray(item.surveyQuestions)) {
+    for (const q of item.surveyQuestions) {
+      const key = q?.question || q?.label || "";
+      const ans = q?.answer ?? q?.value ?? q?.text;
+      if (typeof ans === "string") pushIfGood(ans, key);
+    }
+  }
+  if (Array.isArray(item.answers)) {
+    for (const a of item.answers) {
+      const key = a?.question || a?.label || "";
+      const ans = a?.value ?? a?.text ?? "";
+      if (typeof ans === "string") pushIfGood(ans, key);
+    }
+  }
+
+  const pick = (arr) => {
+    if (!arr.length) return null;
+    // Prefer multi-word first; otherwise longest
+    arr.sort((a, b) => {
+      const aw = wordinessScore(a), bw = wordinessScore(b);
+      if (bw !== aw) return bw - aw;
+      return b.length - a.length;
+    });
+    return arr[0];
+  };
+
+  return pick(preferred) || pick(candidates) || "(no text)";
 }
-function toInt(v, fb) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : fb; }
 
-async function zd() {
-  const sub   = process.env.ZENDESK_SUBDOMAIN;
-  const email = process.env.ZENDESK_EMAIL;
-  const token = process.env.ZENDESK_API_TOKEN;
-  if (!sub || !email || !token) throw new Error("Missing Zendesk env");
-  const auth = Buffer.from(`${email}/token:${token}`).toString("base64");
-  const headers = { "Authorization": `Basic ${auth}`, "Content-Type": "application/json", "Accept": "application/json" };
-  return { sub, headers };
+function wordinessScore(s) {
+  // Crude: words with spaces > long single token
+  const spaces = (s.match(/\s+/g) || []).length;
+  return Math.min(10, spaces) + Math.min(10, Math.floor(s.length / 40));
 }
 
-export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
-
-  // auth
-  const want = process.env.CRON_SECRET || "";
-  const got  = req.headers.authorization || req.headers.Authorization || "";
-  if (want && got !== `Bearer ${want}`) return res.status(401).json({ ok:false, error:"Unauthorized" });
-
-  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
-  if (!CHM_TOKEN) return res.status(500).json({ ok:false, error:"Missing CHATMETER_V5_TOKEN" });
-
-  const minutes = toInt(req.query.minutes || "2880", 2880);
-  const limit   = Math.min(500, toInt(req.query.limit || "200", 200));
-  const sinceIso = new Date(Date.now() - minutes*60*1000).toISOString();
-
+function looksLikeBase64Url(str) {
+  return typeof str === "string" && /^[A-Za-z0-9\-_]{30,}$/.test(str);
+}
+function tryBase64UrlDecode(str) {
   try {
-    const url = `${CHM_BASE}/reviews?limit=${limit}&sortField=reviewDate&sortOrder=DESC&updatedSince=${encodeURIComponent(sinceIso)}`;
-    const r = await fetch(url, { headers: { Authorization: CHM_TOKEN }});
-    const t = await r.text();
-    if (!r.ok) return res.status(502).send(t);
+    let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.length % 4; if (pad) b64 += "=".repeat(4 - pad);
+    return Buffer.from(b64, "base64").toString("utf8");
+  } catch { return ""; }
+}
+function isHumanText(s) {
+  if (!s) return false;
+  const t = s.trim();
 
-    const data = JSON.parse(t || "{}");
-    const items = Array.isArray(data.reviews) ? data.reviews : (data.results || []);
+  // Reject pure booleans / binary / trivial
+  if (/^(true|false|yes|no)$/i.test(t)) return false;
+  if (/^[01]$/.test(t)) return false;
 
-    const { sub, headers } = await zd();
-    let checked = 0, fixed = 0, skipped = 0, errors = 0;
+  // Must contain letters from any locale
+  if (!/\p{L}/u.test(t)) return false;
 
-    for (const it of items) {
-      checked++;
-      const id = it?.id || it?.reviewId || it?.review_id || "";
-      if (!id) { skipped++; continue; }
+  // Require either >= 8 chars OR has whitespace (multi-word)
+  if (t.length < 8 && !/\s/.test(t)) return false;
 
-      const text = pickTextFromReview(it);
-      if (!isGoodText(text)) { skipped++; continue; }
+  // Not only punctuation/digits/underscores
+  if (/^[\d\W_]+$/.test(t)) return false;
 
-      // Ensure the ticket exists; then update fields/tags only
-      const externalId = `chatmeter:${id}`;
-      const sr = await fetch(`https://${sub}.zendesk.com/api/v2/search.json?query=${encodeURIComponent(`external_id:${externalId}`)}`, { headers });
-      const sTxt = await sr.text();
-      if (!sr.ok) { errors++; continue; }
-      const sData = JSON.parse(sTxt || "{}");
-      const match = (sData.results || []).find(r => r.external_id === externalId);
-      if (!match) { skipped++; continue; }
+  // No control chars
+  if (/[\u0000-\u0008\u000E-\u001F]/.test(t)) return false;
 
-      const upd = {
-        ticket: {
-          external_id: externalId,
-          tags: Array.from(new Set([...(match.tags || []), "chatmeter"])),
-          custom_fields: [
-            { id: Number(process.env.ZD_FIELD_REVIEW_ID), value: id },
-            { id: Number(process.env.ZD_FIELD_LOCATION_ID), value: it.locationId || "" },
-            { id: Number(process.env.ZD_FIELD_RATING), value: Number(it.rating || 0) },
-            ...(process.env.ZD_FIELD_LOCATION_NAME
-              ? [{ id: Number(process.env.ZD_FIELD_LOCATION_NAME), value: it.locationName || "" }]
-              : [])
-          ]
-        }
-      };
-      const ur = await fetch(`https://${sub}.zendesk.com/api/v2/tickets/${match.id}.json`, {
-        method: "PUT", headers, body: JSON.stringify(upd)
-      });
-      if (!ur.ok) { errors++; continue; }
-
-      fixed++;
-    }
-
-    return res.json({ ok:true, since: sinceIso, checked, fixed, skipped, errors });
-  } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
+  return true;
 }
