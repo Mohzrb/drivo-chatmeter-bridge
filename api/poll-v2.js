@@ -1,84 +1,63 @@
+// Poll Chatmeter (v5) and forward each review to /api/review-webhook
 export default async function handler(req, res) {
+  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
+
+  const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+  const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;  // raw token (no "Bearer")
+  const SELF_BASE = process.env.SELF_BASE_URL || ""; // e.g., https://drivo-chatmeter-bridge.vercel.app
+  const DEF_MIN   = Number(process.env.POLLER_LOOKBACK_MINUTES || 1440); // default 24h
+  const CHM_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || ""; // optional
+  const CRON_SECRET    = process.env.CRON_SECRET || "";    // optional
+
+  const missing = [
+    !CHM_TOKEN && "CHATMETER_V5_TOKEN",
+    !SELF_BASE && "SELF_BASE_URL",
+  ].filter(Boolean);
+  if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
+
+  // Optional auth for Vercel Cron (if you set CRON_SECRET)
+  const hdr = req.headers?.authorization || req.headers?.Authorization || "";
+  if (CRON_SECRET && hdr !== `Bearer ${CRON_SECRET}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-07" });
+  }
+
   try {
-    // --- auth: require CRON_SECRET unless you're testing locally
-    const want = process.env.CRON_SECRET;
-    const got = req.headers.authorization || "";
-    if (want && got !== `Bearer ${want}`) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-09" });
-    }
-
-    const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
-    if (!CHM_TOKEN) return res.status(500).send("Missing env: CHATMETER_V5_TOKEN");
-
-    // query
-    const minutes   = +(req.query.minutes || 1440); // default 24h
-    const accountId = req.query.accountId || process.env.CHM_ACCOUNT_ID || "";
-    const groupId   = req.query.groupId || "";
-    const clientId  = req.query.clientId || "";
-    const maxItems  = +(req.query.max || 200);
-    // Always enrich, and by default require text
-    const enrich    = true;
-    const requireText = (req.query.requireText ?? "1") !== "0";
-
-    // location name map (optional, JSON string in env)
-    let LOCMAP = {};
-    try { LOCMAP = JSON.parse(process.env.CHM_LOCATION_MAP || "{}"); } catch {}
-
+    const urlObj = new URL(req.url, "http://x");
+    const minutes = Number(urlObj.searchParams.get("minutes") || DEF_MIN);
+    const clientId  = urlObj.searchParams.get("clientId") || "";
+    const accountId = urlObj.searchParams.get("accountId") || CHM_ACCOUNT_ID;
+    const groupId   = urlObj.searchParams.get("groupId") || "";
+    const maxItems  = Number(urlObj.searchParams.get("max") || 50);
     const sinceIso  = new Date(Date.now() - minutes * 60 * 1000).toISOString();
-    const qs = new URLSearchParams({
+
+    const q = new URLSearchParams({
       limit: String(maxItems),
       sortField: "reviewDate",
       sortOrder: "DESC",
       updatedSince: sinceIso
     });
-    if (accountId) qs.set("accountId", accountId);
-    if (groupId)   qs.set("groupId", groupId);
-    if (clientId)  qs.set("clientId", clientId);
+    if (clientId) q.set("clientId", clientId);
+    if (accountId) q.set("accountId", accountId);
+    if (groupId) q.set("groupId", groupId);
 
-    const url = `${CHM_BASE}/reviews?${qs.toString()}`;
-    const list = await jf(url, { headers: { Authorization: CHM_TOKEN } });
-    const items = Array.isArray(list?.reviews) ? list.reviews : (Array.isArray(list) ? list : []);
+    const listUrl = `${CHM_BASE}/reviews?${q.toString()}`;
+    const r = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
+    const text = await r.text();
+    if (!r.ok) return res.status(502).send(`Chatmeter list error: ${r.status} ${text}`);
 
-    let posted = 0, skipped = 0, errors = 0, checked = 0;
-    const SELF_BASE = process.env.SELF_BASE_URL || ""; // recommend setting this
+    const data = safeParse(text, {});
+    const items = Array.isArray(data.reviews) ? data.reviews : (data.results || []);
+    let posted = 0, skipped = 0, errors = 0;
+
     for (const it of items) {
-      checked++;
-      const id = it?.id || it?.reviewId || it?.review_id;
-      if (!id) { skipped++; continue; }
-
-      let detail = it;
-      if (enrich) {
-        try {
-          const durl = `${CHM_BASE}/reviews/${encodeURIComponent(id)}`;
-          detail = await jf(durl, { headers: { Authorization: CHM_TOKEN } });
-        } catch { /* keep list item as fallback */ }
-      }
-
-      const provider   = (detail?.contentProvider || detail?.provider || "").toUpperCase();
-      const text       = extractText(detail) || extractText(it);
-      const rating     = detail?.rating ?? it?.rating ?? 0;
-      const locationId = String(detail?.locationId || it?.locationId || "");
-      const locationName = LOCMAP[locationId] || detail?.locationName || it?.locationName || "Unknown";
-      const authorName = detail?.reviewerUserName || detail?.reviewer || detail?.authorName || "Reviewer";
-      const createdAt  = detail?.reviewDate || detail?.createdAt || "";
-      const publicUrl  = detail?.reviewURL || detail?.publicUrl || "";
-
-      if (requireText && !text) { skipped++; continue; }
-
-      const payload = {
-        id, provider, locationId, locationName, rating,
-        authorName, createdAt, text, publicUrl
-      };
-
+      const payload = normalizeReview(it);
       try {
-        const hook = SELF_BASE ? `${SELF_BASE}/api/review-webhook` : `/api/review-webhook`;
-        const r = await fetch(hook, {
+        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
-        if (!r.ok) { errors++; continue; }
+        if (!resp.ok) { errors++; continue; }
         posted++;
       } catch {
         errors++;
@@ -87,73 +66,84 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      version: "poller-v2-2025-10-09",
+      version: "poller-v2-2025-10-07",
+      echo: {
+        rawUrl: urlObj.pathname + urlObj.search,
+        urlMinutes: String(minutes),
+        urlClientId: clientId || null,
+        urlAccountId: accountId || null,
+        urlGroupId: groupId || null
+      },
       since: sinceIso,
-      used_accountId: accountId || null,
-      used_groupId: groupId || null,
-      used_clientId: clientId || null,
-      requireText,
-      checked, posted, skipped, errors
+      lookback_minutes: minutes,
+      checked: items.length,
+      posted, skipped, errors
     });
   } catch (e) {
     return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
 
-// ---- helpers ----
-async function jf(url, opt) {
-  const r = await fetch(url, opt);
-  const t = await r.text();
-  if (!r.ok) throw new Error(`${r.status} ${t}`);
-  try { return JSON.parse(t); } catch { return {}; }
+/* ---------- helpers ---------- */
+
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+
+function normalizeReview(r) {
+  // provider & free text extraction
+  const provider = (r.contentProvider || r.provider || "").toUpperCase();
+  const text = getReviewTextFromCM(r);
+
+  // location label from optional env map
+  let LOC_MAP = {};
+  try { if (process.env.CHM_LOCATION_MAP) LOC_MAP = JSON.parse(process.env.CHM_LOCATION_MAP); } catch {}
+  const locLabel = LOC_MAP[r.locationId] || r.locationName || "Unknown";
+
+  const author = r.reviewerUserName || r.reviewerName || "Reviewer";
+  return {
+    id: r.id,
+    provider,
+    rating: r.rating ?? 0,
+    locationId: r.locationId,
+    locationName: locLabel,
+    authorName: author,
+    createdAt: r.reviewDate || r.createdAt,
+    text,
+    publicUrl: r.reviewURL || r.publicUrl || ""
+  };
 }
 
-// robust text extraction across providers (enhanced)
-function extractText(obj) {
-  if (!obj || typeof obj !== "object") return "";
-  const p = (obj.contentProvider || obj.provider || "").toUpperCase();
+// provider-aware text extraction (includes Yelp branch)
+function getReviewTextFromCM(r) {
+  const provider = (r.contentProvider || r.provider || "").toUpperCase();
+  const data = Array.isArray(r.reviewData) ? r.reviewData : [];
 
-  // ReviewBuilder often places open text in reviewData entries
-  if (p === "REVIEWBUILDER" && Array.isArray(obj.reviewData)) {
-    const parts = [];
-    for (const rd of obj.reviewData) {
-      const nm = String(rd?.name || "").toLowerCase();
-      if (
-        nm.includes("open") || nm.includes("words") || nm.includes("comment") ||
-        nm.includes("describe") || nm.includes("feedback")
-      ) parts.push(String(rd?.value || "").trim());
+  const val = (names) => {
+    for (const n of names) {
+      const hit = data.find(
+        x => (x.name || x.fieldName || "").toLowerCase() === n.toLowerCase()
+      );
+      if (hit && hit.value) return String(hit.value);
     }
-    const joined = parts.filter(Boolean).join("\n").trim();
-    if (joined) return joined;
+    return "";
+  };
+
+  let text =
+    val(["np_reviewContent", "reviewContent", "np_comment", "comment"]) ||
+    r.text ||
+    "";
+
+  if (provider === "YELP") {
+    text = val(["np_reviewText", "reviewText", "np_comment", "comment"]) || text;
+  }
+  if (provider === "GOOGLE") {
+    text = val(["np_reviewComment", "review_comment", "comment"]) || text;
+  }
+  if (provider === "TRUSTPILOT") {
+    text = val(["np_reviewText", "reviewText", "comment"]) || text;
+  }
+  if (provider === "REVIEWBUILDER") {
+    text = val(["open_text", "free_text", "comment"]) || text;
   }
 
-  // Common fields for Google/Yelp/Trustpilot/Facebook & aggregators
-  const candidates = [
-    obj.comment, obj.text, obj.reviewText, obj.body, obj.content, obj.reviewerComment,
-    obj.snippet, obj.description, obj.message, obj.originalText, obj.textOriginal,
-    obj.plainText, obj.review
-  ]
-  .map(x => (typeof x === "string" ? x.trim() : ""))
-  .filter(Boolean);
-
-  if (candidates.length) {
-    // pick the longest non-linky string
-    candidates.sort((a,b)=>b.length-a.length);
-    const best = candidates.find(s => !/^https?:\/\//i.test(s)) || candidates[0];
-    return best;
-  }
-
-  // fallback: deep scan strings
-  let best = "";
-  (function scan(o){
-    if (typeof o === "string") {
-      const s = o.trim();
-      if (s.length > best.length && !/^https?:\/\//i.test(s) && !/^\d{4}-\d{2}-\d{2}T/.test(s))
-        best = s;
-      return;
-    }
-    if (Array.isArray(o)) o.forEach(scan);
-    else if (o && typeof o === "object") Object.values(o).forEach(scan);
-  })(obj);
-  return best;
+  return (text || "").trim();
 }
