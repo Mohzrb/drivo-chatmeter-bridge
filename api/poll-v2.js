@@ -1,75 +1,135 @@
 // api/poll-v2.js
 //
-// Poll Chatmeter for recent reviews and forward each to /api/review-webhook.
-// Deduping happens in /api/review-webhook by external_id.
+// Chatmeter → (this poller) → /api/review-webhook → Zendesk ticket
 //
-// GET /api/poll-v2?minutes=1440&max=50&accountId=...&clientId=...&groupId=...&dry=0
-// Header: Authorization: Bearer <CRON_SECRET>
+// Query params:
+//   minutes   : lookback window in minutes (default 60)
+//   accountId : Chatmeter accountId (optional; falls back to CHM_ACCOUNT_ID)
+//   clientId  : Chatmeter clientId (optional)
+//   groupId   : Chatmeter groupId (optional)
+//   max       : max items to fetch (default 50, cap 200)
+//   dry       : if present and truthy, do not call /api/review-webhook (debug only)
+//
+// Auth:
+//   If process.env.CRON_SECRET is set, caller must send
+//     Authorization: Bearer <CRON_SECRET>
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
-
-    // --- auth (cron) ---
-    const want = process.env.CRON_SECRET || "";
-    const got = req.headers.authorization || "";
-    if (want && got !== `Bearer ${want}`) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-08" });
+    if (req.method !== "GET") {
+      return res.status(405).send("Method Not Allowed");
     }
 
-    // --- env ---
+    // --- Auth (allow local/test calls if CRON_SECRET not set)
+    const want = process.env.CRON_SECRET;
+    const got =
+      req.headers.authorization ||
+      req.headers.Authorization ||
+      "";
+    if (want && got !== `Bearer ${want}`) {
+      return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-09" });
+    }
+
+    // --- ENV
     const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;
-    const SELF_BASE = process.env.SELF_BASE_URL || `https://${req?.headers?.host}`;
+    const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;        // raw token (no "Bearer")
+    const SELF_BASE = process.env.SELF_BASE_URL || "";       // e.g., https://drivo-chatmeter-bridge.vercel.app
+    const DEF_ACCT  = process.env.CHM_ACCOUNT_ID || "";      // optional default accountId
+    const LOC_MAP   = safeParse(process.env.CHM_LOCATION_MAP || "{}", {});
 
     if (!CHM_TOKEN) return res.status(500).send("Missing env: CHATMETER_V5_TOKEN");
+    if (!SELF_BASE) return res.status(500).send("Missing env: SELF_BASE_URL");
 
-    // --- inputs ---
+    // --- Query options
     const q = req.query || {};
-    const minutes   = clampInt(q.minutes, 60, 43200, 1440);
-    const max       = clampInt(q.max, 1, 200, 50);
-    const clientId  = str(q.clientId);
-    const accountId = str(q.accountId);
-    const groupId   = str(q.groupId);
-    const dry       = toBool(q.dry);
+    const minutes  = clampInt(q.minutes, 60, 5, 43200); // default 60m, min 5m, max 30d
+    const clientId = (q.clientId || "").toString().trim();
+    const accountId= ((q.accountId || DEF_ACCT) || "").toString().trim();
+    const groupId  = (q.groupId || "").toString().trim();
+    const max      = clampInt(q.max, 50, 1, 200);
+    const dryRun   = isTruthy(q.dry);
 
     const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    const url = new URL(`${CHM_BASE}/reviews`);
-    url.searchParams.set("limit", String(max));
-    url.searchParams.set("sortField", "reviewDate");
-    url.searchParams.set("sortOrder", "DESC");
-    url.searchParams.set("updatedSince", sinceIso);
-    if (clientId)  url.searchParams.set("clientId", clientId);
-    if (accountId) url.searchParams.set("accountId", accountId);
-    if (groupId)   url.searchParams.set("groupId", groupId);
+    // --- Build Chatmeter list URL
+    const params = new URLSearchParams({
+      limit: String(max),
+      sortField: "reviewDate",
+      sortOrder: "DESC",
+      updatedSince: sinceIso
+    });
+    if (clientId)  params.set("clientId",  clientId);
+    if (accountId) params.set("accountId", accountId);
+    if (groupId)   params.set("groupId",   groupId);
 
-    const r = await fetch(url.toString(), { headers: { Authorization: CHM_TOKEN } });
-    const txt = await r.text();
-    if (!r.ok) return res.status(502).send(`Chatmeter error: ${r.status} ${txt}`);
-    const data = safeJson(txt, {});
-    const items = Array.isArray(data?.reviews) ? data.reviews : (Array.isArray(data) ? data : []);
+    const listUrl = `${CHM_BASE}/reviews?${params.toString()}`;
 
-    let posted = 0, errors = 0, skipped = 0;
+    // --- Fetch from Chatmeter
+    const chmRes = await fetch(listUrl, { headers: { Authorization: CHM_TOKEN } });
+    const chmTxt = await chmRes.text();
+    if (!chmRes.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: `Chatmeter list error ${chmRes.status}`,
+        body_snippet: chmTxt.slice(0, 400),
+        version: "poller-v2-2025-10-09"
+      });
+    }
+
+    const parsed = safeParse(chmTxt, {});
+    const items =
+      Array.isArray(parsed) ? parsed :
+      Array.isArray(parsed?.results) ? parsed.results :
+      Array.isArray(parsed?.reviews) ? parsed.reviews : [];
+
+    let posted = 0, skipped = 0, errors = 0;
+
     for (const it of items) {
-      const reviewId = getReviewId(it);
-      if (!reviewId) { skipped++; continue; }
+      const id =
+        it?.id ||
+        it?.reviewId ||
+        it?.review_id ||
+        it?.providerReviewId ||
+        null;
 
-      const payload = toBridgePayload(it, reviewId);
+      if (!id) { skipped++; continue; }
 
-      if (dry) { posted++; continue; }
+      // Normalize provider / text / url
+      const provider = normalizeProvider(it?.contentProvider || it?.provider || "");
+      const text     = extractReviewText(it);
+      const link     = buildPublicUrl(it);
+
+      // Optional: map locationName from env map if available
+      const locName = it?.locationName ||
+                      LOC_MAP[String(it?.locationId)] ||
+                      "Unknown";
+
+      // Construct payload for /api/review-webhook
+      const payload = {
+        id:           String(id),
+        provider:     provider,                     // GOOGLE/YELP/TRUSTPILOT/FACEBOOK/BING/REVIEWBUILDER/SURVEYS…
+        locationId:   String(it?.locationId || ""),
+        locationName: String(locName),
+        rating:       Number(it?.rating || 0),
+        authorName:   it?.reviewerUserName || it?.authorName || "Reviewer",
+        createdAt:    it?.reviewDate || it?.createdAt || "",
+        text:         text || "",
+        publicUrl:    link || ""
+      };
 
       try {
-        const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        if (!resp.ok) {
-          errors++;
-        } else {
-          posted++;
+        if (!dryRun) {
+          const resp = await fetch(`${SELF_BASE}/api/review-webhook`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (!resp.ok) {
+            errors++;
+            continue;
+          }
         }
+        posted++;
       } catch {
         errors++;
       }
@@ -77,134 +137,112 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      version: "poller-v2-2025-10-08",
-      echo: { minutes, clientId, accountId, groupId, dry, maxItems: max },
+      version: "poller-v2-2025-10-09",
+      echo: {
+        minutes,
+        clientId,
+        accountId,
+        groupId,
+        dry: dryRun,
+        maxItems: max
+      },
       since: sinceIso,
       checked: items.length,
-      posted, skipped, errors
+      posted,
+      skipped,
+      errors,
+      debug: {
+        url: listUrl,
+        body_snippet: chmTxt.slice(0, 400)
+      }
     });
 
   } catch (e) {
-    return res.status(500).send(`Error: ${e?.message || e}`);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || String(e),
+      version: "poller-v2-2025-10-09"
+    });
   }
 }
 
-/* ---------------- helpers ---------------- */
+/* ----------------------- helpers ----------------------- */
 
-function clampInt(v, min, max, def) {
+function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
+
+function clampInt(v, def, min, max) {
   const n = parseInt(v, 10);
-  if (Number.isFinite(n)) return Math.max(min, Math.min(max, n));
+  if (Number.isFinite(n)) return Math.min(Math.max(n, min), max);
   return def;
 }
-function str(v){ return (typeof v === "string" && v.trim()) ? v.trim() : ""; }
-function toBool(v){ return String(v).toLowerCase() === "1" || String(v).toLowerCase() === "true"; }
-function safeJson(s, fb){ try { return JSON.parse(s); } catch { return fb; } }
-
-function getReviewId(it) {
-  return it?.id || it?.reviewId || it?.review_id || it?.providerReviewId || null;
+function isTruthy(v) {
+  if (v === true) return true;
+  const s = (v || "").toString().toLowerCase();
+  return ["1","true","yes","y","on"].includes(s);
 }
 
-function toBridgePayload(it, reviewId) {
-  const rating = toInt(it?.rating, 0);
-  const provider = String(it?.contentProvider || it?.provider || it?.source || "").toUpperCase() || "UNKNOWN";
+// Normalize provider labels to stable set
+function normalizeProvider(p) {
+  const v = (p || "").toString().trim().toUpperCase();
+  if (!v) return "";
 
-  const author = it?.reviewerUserName || it?.reviewer || it?.authorName || it?.customerName || "Reviewer";
-  const email  = it?.reviewerEmail || it?.email || "";
-  const createdAt =
-    it?.reviewDate || it?.createdAt || it?.created_at || new Date().toISOString();
+  const MAP = {
+    "GOOGLE": "GOOGLE",
+    "GOOGLE MAPS": "GOOGLE",
+    "GMAPS": "GOOGLE",
 
-  const text = extractBestText(it);
+    "YELP": "YELP",
 
-  const publicUrl = it?.reviewURL || it?.publicUrl || it?.portalUrl || "";
-  const locationId   = String(it?.locationId || "");
-  const locationName = String(it?.locationName || "");
+    "TRUSTPILOT": "TRUSTPILOT",
+    "TRUST PILOT": "TRUSTPILOT",
 
-  return {
-    id: String(reviewId),
-    provider,
-    rating,
-    authorName: String(author),
-    authorEmail: String(email),
-    createdAt: String(createdAt),
-    text,
-    publicUrl: String(publicUrl),
-    locationId,
-    locationName
+    "FACEBOOK": "FACEBOOK",
+    "META": "FACEBOOK",
+    "FB": "FACEBOOK",
+
+    "BING": "BING",
+    "MICROSOFT": "BING",
+
+    "REVIEWBUILDER": "REVIEWBUILDER",
+    "SURVEYS": "SURVEYS"
   };
+
+  return MAP[v] || v; // default to upper-case source if unmapped
 }
 
-function toInt(v, fb){ const n = parseInt(v, 10); return Number.isFinite(n) ? n : fb; }
+// Extract human review text across providers (incl. surveys)
+function extractReviewText(item) {
+  // 1) If Chatmeter already put text here
+  if (item?.text && String(item.text).trim()) return String(item.text).trim();
 
-/* -------------- robust human text extractor (v2) -------------- */
-function extractBestText(item) {
-  const candidates = [];
+  // 2) Survey/ReviewBuilder answers often in reviewData
+  const data = Array.isArray(item?.reviewData) ? item.reviewData : [];
+  if (data.length) {
+    const KEYS = ["nptext", "freeformanswer", "freeform", "comment", "text", "reviewtext"];
 
-  const pushIfText = (v) => {
-    if (typeof v !== "string") return;
-    const s = v.trim();
-    const dec = looksLikeBase64Url(s) ? tryBase64UrlDecode(s).trim() || s : s;
-    if (isHumanText(dec)) candidates.push(dec);
-  };
-
-  // 1) Common top-level fields
-  [
-    item.text, item.reviewText, item.body, item.comment, item.content,
-    item.review, item.reviewerComments, item.providerReviewText,
-    item.freeText, item.free_text, item.nps_comment, item.np_comments
-  ].forEach(pushIfText);
-
-  // 2) ReviewBuilder / survey pairs
-  if (Array.isArray(item.reviewData)) {
-    for (const p of item.reviewData) {
-      const key = String(p?.name || "").toLowerCase().replace(/[\s\-]/g, "_");
-      const val = p?.value;
-      const isLikelyTextKey = /(comment|comments|review|free[_]?text|text|nps|np)/.test(key);
-      if (typeof val === "string") {
-        if (isLikelyTextKey) pushIfText(val);
-        else if (isHumanText(val)) candidates.push(val.trim());
-      } else if (val && typeof val === "object" && typeof val.value === "string") {
-        const vv = val.value;
-        if (isLikelyTextKey) pushIfText(vv);
-        else if (isHumanText(vv)) candidates.push(vv.trim());
+    for (const d of data) {
+      const name = (d?.name || "").toString().toLowerCase();
+      if (KEYS.includes(name) && d?.value && String(d.value).trim()) {
+        return String(d.value).trim();
       }
     }
+
+    const joined = data
+      .map(d => d?.value)
+      .filter(v => v && String(v).trim())
+      .join(" | ");
+    if (joined) return joined;
   }
 
-  // 3) Some NPS/Survey shapes
-  if (Array.isArray(item.surveyQuestions)) {
-    for (const q of item.surveyQuestions) {
-      const ans = q?.answer ?? q?.value ?? q?.text;
-      pushIfText(String(ans || ""));
-    }
-  }
-  if (Array.isArray(item.answers)) {
-    for (const a of item.answers) pushIfText(String(a?.value ?? a?.text ?? ""));
-  }
+  // 3) Some providers may place under other fields
+  const maybe = item?.reviewerComment || item?.comment || item?.review;
+  if (maybe && String(maybe).trim()) return String(maybe).trim();
 
-  if (candidates.length) {
-    candidates.sort((a, b) => b.length - a.length);
-    return candidates[0];
-  }
-  return "(no text)";
+  return "";
 }
 
-function looksLikeBase64Url(str) {
-  return typeof str === "string" && /^[A-Za-z0-9\-_]{30,}$/.test(str);
-}
-function tryBase64UrlDecode(str) {
-  try {
-    let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = b64.length % 4; if (pad) b64 += "=".repeat(4 - pad);
-    return Buffer.from(b64, "base64").toString("utf8");
-  } catch { return ""; }
-}
-function isHumanText(s) {
-  if (!s) return false;
-  const t = s.trim();
-  if (!/\p{L}/u.test(t)) return false;
-  if (/^(true|false|yes|no)$/i.test(t)) return false;
-  if (t.length < 3) return false;
-  if (/^[\d\W_]+$/.test(t)) return false;
-  if (/[\u0000-\u0008\u000E-\u001F]/.test(t)) return false;
-  return true;
+// Build a viewable link when Chatmeter provides one
+function buildPublicUrl(item) {
+  const url = item?.reviewURL || item?.publicUrl || item?.portalUrl || "";
+  return url ? String(url) : "";
 }
