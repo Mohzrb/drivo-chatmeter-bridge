@@ -22,21 +22,24 @@ function looksLikeRating(x) {
   return false;
 }
 
-/** junk tokens we never want as a comment (urls, ids, uuids, long no-space strings) */
+/** junk tokens we never want as a comment (urls, ids, uuids, encoded hashes, etc.) */
 function isJunkText(s) {
   if (!isNonEmptyString(s)) return true;
   const t = s.trim();
 
+  // obvious junk
   if (isBooleanString(t)) return true;                      // true / false
   if (/^https?:\/\//i.test(t)) return true;                 // URL
   if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;           // ISO date/time
-  if (looksLikeRating(t)) return true;
+  if (looksLikeRating(t)) return true;                      // 5, 4/5, ★★★★☆
 
-  // hex ids / uuids / base64-ish long tokens / long no-space strings
-  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;            // 24+ hex
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // uuid
-  if (/^[A-Za-z0-9+/_-]{24,}$/.test(t) && !/\s/.test(t)) return true;
-  if (t.length > 20 && !/\s/.test(t)) return true;
+  // ids / uuids
+  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;            // 24+ hex (mongo-like)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // UUID
+
+  // Yelp/Google often return base64-ish or hex-like tokens when no text is available.
+  // Treat as junk only if it's a long no-space string with *no vowels* (to avoid killing real short words).
+  if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t)) return true;
 
   return false;
 }
@@ -130,7 +133,7 @@ export function getProviderComment(providerInput, review) {
     }
   }
 
-  // 4) Deep scan as last resort (skip urls/dates/booleans/ratings)
+  // 4) Deep scan as last resort (skip urls/dates/booleans/ratings/junk)
   let best = "";
   (function scan(o) {
     if (!o) return;
@@ -220,7 +223,7 @@ export function buildInternalNote({
   if (isNonEmptyString(customerEmail)) contactLines.push(customerEmail.trim());
   if (isNonEmptyString(customerPhone)) contactLines.push(customerPhone.trim());
   if (contactLines.length) {
-    // insert right after Customer line (index 3)
+    // insert right after Customer line
     lines.splice(4, 0, ...contactLines);
   }
 
