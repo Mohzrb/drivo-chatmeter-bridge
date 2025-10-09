@@ -1,4 +1,5 @@
 // _helpers.js
+
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0 && v !== "false" && v !== "true";
 }
@@ -8,16 +9,46 @@ export function normalizeProvider(provider) {
   return String(provider).trim().toUpperCase();
 }
 
+export function extractReviewBuilderComment(review) {
+  if (!review.reviewData || !Array.isArray(review.reviewData)) return "";
+  const field = review.reviewData.find((r) =>
+    /in your own words|describe.*experience/i.test(r.name)
+  );
+  return field?.value?.trim() || "";
+}
+
+export function extractYelpGoogleComment(review) {
+  if (!review) return "";
+  // Chatmeter can store review text under different fields depending on source
+  return (
+    review.text ||
+    review.reviewBody ||
+    review.body ||
+    review.snippet ||
+    (isNonEmptyString(review.comment) ? review.comment : "") ||
+    ""
+  );
+}
+
+export function getProviderComment(review) {
+  const provider = normalizeProvider(review.contentProvider || review.provider);
+  let text = "";
+
+  if (provider.includes("REVIEWBUILDER")) text = extractReviewBuilderComment(review);
+  else if (provider.includes("GOOGLE") || provider.includes("YELP")) text = extractYelpGoogleComment(review);
+  else text = review.comment || "";
+
+  if (!isNonEmptyString(text)) return "(no text)";
+  return text;
+}
+
 export function buildInternalNote({ review, link }) {
   const date = review.reviewDate || review.dateAdded || review.date || "";
   const customer = review.reviewerUserName || review.customerName || review.name || "";
   const provider = normalizeProvider(review.contentProvider || review.provider);
   const location = `${review.locationName || ""} (${review.locationId || ""})`;
   const rating = "★".repeat(review.rating || 0);
-  const comment =
-    review.comment && isNonEmptyString(review.comment)
-      ? review.comment
-      : extractReviewBuilderComment(review) || "(no text)";
+  const comment = getProviderComment(review);
 
   return (
     `Review Information\n` +
@@ -31,27 +62,11 @@ export function buildInternalNote({ review, link }) {
   );
 }
 
-function extractReviewBuilderComment(review) {
-  if (!review.reviewData || !Array.isArray(review.reviewData)) return "";
-  const field = review.reviewData.find((r) =>
-    /in your own words|describe.*experience/i.test(r.name)
-  );
-  return field?.value?.trim() || "";
-}
-
 export function pickCustomerContact(review) {
   return (
     review.reviewerEmail ||
     review.email ||
     (review.reviewer && review.reviewer.email) ||
-    ""
-  );
-}
-
-export function getProviderComment(review) {
-  return (
-    review.comment ||
-    (review.reviewData && review.reviewData.map((r) => r.value).join(" ")) ||
     ""
   );
 }
