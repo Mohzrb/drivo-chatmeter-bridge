@@ -1,20 +1,39 @@
-name: Poll Chatmeter (every 15 min)
+name: Chatmeter Bridge Poller
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch: {}       # allow manual run
+
+concurrency:
+  group: chatmeter-poller
+  cancel-in-progress: true
 
 jobs:
-  poll:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
-      - name: Call Vercel poller
-        env:
-          BASE_URL: https://drivo-chatmeter-bridge.vercel.app
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          ACCOUNT_ID: 6646597de7a19144ba286d92
+      - name: Hit poll-v2 (collect new reviews)
         run: |
-          set -e
-          curl -sS -H "Authorization: Bearer $CRON_SECRET" \
-            "$BASE_URL/api/poll-v2?minutes=20&accountId=$ACCOUNT_ID&max=50"
+          curl -fsS -H "Authorization: Bearer $CRON_SECRET" \
+            "$BASE_URL/api/poll-v2?minutes=30&max=50"
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+
+      - name: Fix missing (pulls detail text when available)
+        run: |
+          curl -fsS -H "Authorization: Bearer $CRON_SECRET" \
+            "$BASE_URL/api/fix-missing?minutes=30&limit=200"
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+
+      - name: Backfill links (Yelp/Google/Trustpilot link note if no text)
+        run: |
+          curl -fsS -H "Authorization: Bearer $CRON_SECRET" \
+            "$BASE_URL/api/fix-missing-links?minutes=30&limit=200"
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
