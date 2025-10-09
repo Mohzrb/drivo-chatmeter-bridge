@@ -5,100 +5,129 @@ export default async function handler(req, res) {
   const {
     CHATMETER_V5_BASE = "https://live.chatmeter.com/v5",
     CHATMETER_V5_TOKEN,
-    CHM_ACCOUNT_ID,                  // optional default
-    CHM_LOCATION_MAP,                // optional JSON { "1001":"JFK", ... }
-    SELF_BASE_URL,                   // optional (falls back to req.headers.host)
-    CRON_SECRET                      // required if you want to protect this endpoint
+    CHM_ACCOUNT_ID,
+    CHM_LOCATION_MAP,
+    SELF_BASE_URL,
+    CRON_SECRET
   } = process.env;
 
-  // Require CRON_SECRET unless explicitly running without it
+  const version = "poller-v2-ultradeep-2025-10-08";
+
+  // Protect with CRON_SECRET if present
   const gotAuth = req.headers.authorization || req.headers.Authorization || "";
   if (CRON_SECRET && gotAuth !== `Bearer ${CRON_SECRET}`) {
     return res.status(401).json({ ok: false, error: "Unauthorized", version });
   }
+  if (!CHATMETER_V5_TOKEN) return res.status(500).send("Missing env: CHATMETER_V5_TOKEN");
 
-  const urlObj = new URL(req.url, "http://localhost"); // not used for host, only for query parsing
+  // Parse query
+  const urlObj = new URL(req.url, "http://localhost");
   const q = Object.fromEntries(urlObj.searchParams.entries());
+
+  // New: single-review debugging
+  const singleId  = (q.id || "").trim();
 
   const minutes   = Number(q.minutes || q.m || 15);
   const clientId  = (q.clientId || "").trim();
   const accountId = (q.accountId || CHM_ACCOUNT_ID || "").trim();
   const groupId   = (q.groupId || "").trim();
-  const providers = (q.providers || "").trim();          // e.g. GOOGLE or GOOGLE,YELP
-  const maxItems  = Math.min(Number(q.max || 50), 50);   // safety cap
+  const providers = (q.providers || "").trim();        // e.g. GOOGLE,YELP
+  const maxItems  = Math.min(Number(q.max || 50), 50); // safety cap
   const dryRun    = q.dry === "1" || q.dry === "true";
+  const wantDebug = q.debug === "1" || q.debug === "true";
 
   const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
   const BASE = CHATMETER_V5_BASE;
   const TOKEN = CHATMETER_V5_TOKEN;
 
-  if (!TOKEN) return res.status(500).send("Missing env: CHATMETER_V5_TOKEN");
-
   const host = SELF_BASE_URL || `https://${req.headers.host}`;
   const forwardTo = `${host}/api/review-webhook`;
 
-  // Provider families that often need detail calls to get the comment text
-  const ALWAYS_DETAIL_PROVIDERS = new Set(["GOOGLE","YELP","TRUSTPILOT","FACEBOOK","BING","MICROSOFT"]);
+  // Providers for which we always pull detail
+  const ALWAYS_DETAIL = new Set(["GOOGLE", "YELP", "TRUSTPILOT", "FACEBOOK", "BING", "MICROSOFT"]);
 
-  // Parse mapping
   let LOCATION_MAP = {};
   try { LOCATION_MAP = CHM_LOCATION_MAP ? JSON.parse(CHM_LOCATION_MAP) : {}; } catch {}
 
-  const version = "poller-v2-ultrasafe+surveytext-2025-10-07";
-
-  const params = new URLSearchParams({
-    limit: String(maxItems),
-    sortField: "reviewDate",
-    sortOrder: "DESC",
-    updatedSince: sinceIso
-  });
-  if (clientId)  params.set("clientId", clientId);
-  if (accountId) params.set("accountId", accountId);
-  if (groupId)   params.set("groupId", groupId);
-  if (providers) params.set("providers", providers);
-
-  const listUrl = `${BASE}/reviews?${params.toString()}`;
+  // Helper to fetch JSON safely
+  const fetchJson = async (url) => {
+    const r = await fetch(url, { headers: { Authorization: TOKEN } });
+    const t = await r.text();
+    return { ok: r.ok, status: r.status, text: t, json: safeParse(t, {}) };
+  };
 
   try {
-    const listRes = await fetch(listUrl, { headers: { Authorization: TOKEN } });
-    const listTxt = await listRes.text();
-    if (!listRes.ok) return res.status(502).send(`Chatmeter list error: ${listRes.status} ${listTxt}`);
+    let items = [];
+    let listUrl = "";
+    let listRaw = "";
 
-    const parsed = safeParse(listTxt, {});
-    const items = Array.isArray(parsed?.reviews) ? parsed.reviews :
-                  Array.isArray(parsed)           ? parsed :
-                  Array.isArray(parsed?.results)  ? parsed.results : [];
+    if (singleId) {
+      // ----- single review mode
+      const det = await fetchJson(`${BASE}/reviews/${encodeURIComponent(singleId)}`);
+      if (!det.ok) return res.status(502).send(`Chatmeter detail error: ${det.status} ${det.text}`);
+      items = [det.json];
+      listUrl = `${BASE}/reviews/${singleId}`;
+      listRaw = det.text;
+    } else {
+      // ----- list mode
+      const params = new URLSearchParams({
+        limit: String(maxItems),
+        sortField: "reviewDate",
+        sortOrder: "DESC",
+        updatedSince: sinceIso
+      });
+      if (clientId)  params.set("clientId", clientId);
+      if (accountId) params.set("accountId", accountId);
+      if (groupId)   params.set("groupId", groupId);
+      if (providers) params.set("providers", providers);
+
+      listUrl = `${BASE}/reviews?${params.toString()}`;
+
+      const list = await fetchJson(listUrl);
+      if (!list.ok) return res.status(502).send(`Chatmeter list error: ${list.status} ${list.text}`);
+      listRaw = list.text;
+
+      const j = list.json;
+      items = Array.isArray(j?.reviews) ? j.reviews :
+              Array.isArray(j) ? j :
+              Array.isArray(j?.results) ? j.results : [];
+    }
 
     let posted = 0, skipped = 0, errors = 0;
+    const debugMissing = [];
+
     for (const r of items) {
       const id = r?.id || r?.reviewId || r?.review_id;
       if (!id) { skipped++; continue; }
 
-      // Normalize provider
       let provider = String(r.contentProvider || r.provider || r.source || "").toUpperCase();
       if (provider.includes("MICROSOFT")) provider = "BING";
 
-      // Text extraction
-      let text = pickText(r);
+      // Step 1: try text from list object
+      let text = extractText(r);
 
-      // Fetch detail if we must or if text is empty
-      if (!text || ALWAYS_DETAIL_PROVIDERS.has(provider)) {
+      // Step 2: detail fetch when needed
+      if (!text || ALWAYS_DETAIL.has(provider)) {
         try {
-          const detRes = await fetch(`${BASE}/reviews/${encodeURIComponent(id)}`, {
-            headers: { Authorization: TOKEN }
-          });
-          if (detRes.ok) {
-            const det = await detRes.json().catch(() => ({}));
-            text = pickText(det) || text;
+          const det = await fetchJson(`${BASE}/reviews/${encodeURIComponent(id)}`);
+          if (det.ok) {
+            text = extractText(det.json) || text;
+            // If still nothing, capture a small debug blob (on demand)
+            if (!text && wantDebug && debugMissing.length < 3) {
+              debugMissing.push({
+                id, provider,
+                keys: Object.keys(det.json || {}).slice(0, 20),
+                sample: stringifyShort(det.json, 1600)
+              });
+            }
           }
         } catch { /* ignore */ }
       }
 
-      // Location name (prefer mapping, else payload, avoid numeric in the subject)
-      const locationId = String(r.locationId || r.location_id || "");
+      // Some reviews are truly rating-only; if text is blank after deep search we accept "(no text)"
+      const locationId   = String(r.locationId || r.location_id || "");
       const locationName = LOCATION_MAP[locationId] || r.locationName || r.location || "Unknown";
 
-      // Build the canonical payload we expect in /api/review-webhook
       const payload = {
         id,
         provider,
@@ -132,46 +161,105 @@ export default async function handler(req, res) {
       version,
       echo: {
         rawUrl: `/api/poll-v2?${new URLSearchParams(q).toString()}`,
-        minutes, clientId, accountId, groupId, dry: dryRun, maxItems
+        minutes, clientId, accountId, groupId, dry: dryRun, maxItems,
+        singleId: singleId || null
       },
       since: sinceIso,
       checked: items.length,
       posted, skipped, errors,
-      debug: { url: listUrl, body_snippet: listTxt.slice(0, 180) }
+      debug: wantDebug ? { url: listUrl, body_snippet: listRaw.slice(0, 300), missing: debugMissing } : undefined
     });
   } catch (e) {
     return res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
 
-// -------- helpers --------
+// ----------------- helpers -----------------
+
 function safeParse(s, fb) { try { return JSON.parse(s); } catch { return fb; } }
 
-// Try very hard to find a human comment in any shape the API might return
-function pickText(obj) {
-  if (!obj || typeof obj !== "object") return "";
-  const val = v => (typeof v === "string" && v.trim()) ? v.trim() : "";
+// Human-like string test
+function looksLikeHumanText(str) {
+  if (!str || typeof str !== "string") return false;
+  const s = str.trim();
+  if (s.length < 15) return false;                  // too short to be a comment
+  if (/^https?:\/\//i.test(s)) return false;        // url
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return false;  // iso date
+  if (/^[A-F0-9\-]{20,}$/i.test(s)) return false;   // id-like
+  // needs spaces and letters
+  if (!/[a-z]/i.test(s) || !/\s/.test(s)) return false;
+  return true;
+}
 
-  // common direct fields
-  const direct = val(obj.text) || val(obj.comment) || val(obj.body) ||
-                 val(obj.reviewText) || val(obj.review_text) ||
-                 val(obj.description) || val(obj.content) || val(obj.message);
-  if (direct) return direct;
+// Deep search through any object for best comment candidate
+function deepSearchForText(obj, preferKeyHint = false) {
+  let best = "";
+  const visit = (node, key = "") => {
+    if (!node) return;
+    if (typeof node === "string") {
+      if (looksLikeHumanText(node)) {
+        if (preferKeyHint) {
+          // slightly prefer strings coming from commentish keys
+          if (node.length >= best.length || /comment|text|review|feedback|message/i.test(key)) best = node.trim();
+        } else {
+          if (node.length > best.length) best = node.trim();
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const v of node) visit(v, key);
+      return;
+    }
+    if (typeof node === "object") {
+      for (const [k, v] of Object.entries(node)) visit(v, k);
+    }
+  };
+  visit(obj);
+  return best;
+}
 
-  // nested
-  if (obj.review) {
-    const fromReview = val(obj.review.text) || val(obj.review.body);
-    if (fromReview) return fromReview;
+// Extract text using a layering strategy
+function extractText(o) {
+  if (!o || typeof o !== "object") return "";
+
+  const pick = (v) => (typeof v === "string" && v.trim()) ? v.trim() : "";
+  // 1) common direct keys
+  for (const k of ["text","comment","body","reviewText","review_text","description","message","content"]) {
+    const v = pick(o[k]);
+    if (looksLikeHumanText(v)) return v;
   }
-
-  // Survey/reviewBuilder style
-  if (Array.isArray(obj.reviewData)) {
-    const hit = obj.reviewData.find(x => x && /comment|text|review|feedback/i.test(x.name || ""));
-    if (hit) {
-      const fromRD = val(hit.value);
-      if (fromRD) return fromRD;
+  // 2) nested 'review'
+  if (o.review) {
+    for (const k of ["text","comment","body","description","message"]) {
+      const v = pick(o.review[k]);
+      if (looksLikeHumanText(v)) return v;
     }
   }
+  // 3) survey/reviewBuilder: reviewData[{name|label,value}]
+  if (Array.isArray(o.reviewData)) {
+    const hit = o.reviewData.find(x =>
+      x && /comment|text|review|feedback|message/i.test(String(x.name||x.label||""))
+    );
+    const v = pick(hit?.value);
+    if (looksLikeHumanText(v)) return v;
+    // else try any long-ish value in reviewData
+    for (const x of o.reviewData) {
+      const vv = pick(x?.value);
+      if (looksLikeHumanText(vv)) return vv;
+    }
+  }
+  // 4) deep recursive catch-all (prefers commentish keys)
+  const hinted = deepSearchForText(o, true);
+  if (hinted) return hinted;
 
-  return "";
+  // 5) last resort: longest human-like string anywhere
+  return deepSearchForText(o, false);
+}
+
+function stringifyShort(obj, maxLen = 1200) {
+  let s = "";
+  try { s = JSON.stringify(obj); } catch {}
+  if (s.length > maxLen) s = s.slice(0, maxLen) + "…";
+  return s;
 }
