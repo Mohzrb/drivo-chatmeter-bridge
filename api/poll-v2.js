@@ -9,6 +9,82 @@ function isGoodText(v) {
   if (/^[a-f0-9]{24}$/i.test(s)) return false;
   return true;
 }
+// --- Provider normalization (Chatmeter can vary names per source)
+function normalizeProvider(p) {
+  const v = (p || "").toString().trim().toUpperCase();
+  if (!v) return "";
+
+  // Map common variants to a single label
+  const MAP = {
+    "GOOGLE": "GOOGLE",
+    "GOOGLE MAPS": "GOOGLE",
+    "GMAPS": "GOOGLE",
+    "YELP": "YELP",
+    "TRUSTPILOT": "TRUSTPILOT",
+    "TRUST PILOT": "TRUSTPILOT",
+    "FACEBOOK": "FACEBOOK",
+    "META": "FACEBOOK",
+    "FB": "FACEBOOK",
+    "BING": "BING",
+    "MICROSOFT": "BING",
+    "REVIEWBUILDER": "REVIEWBUILDER",
+    "SURVEYS": "SURVEYS"
+  };
+
+  return MAP[v] || v; // fall back to the raw upper value
+}
+
+// --- Extract a readable text/comment across ALL providers (incl. surveys)
+function extractReviewText(item) {
+  // 1) direct text if present
+  if (item?.text && String(item.text).trim()) return String(item.text).trim();
+
+  // 2) Chatmeter sometimes sends "reviewData" with survey/NPX answers
+  //    Look for commonly used keys and take the first non-empty free text.
+  const data = Array.isArray(item?.reviewData) ? item.reviewData : [];
+  if (data.length) {
+    // Look for typical free-form answers Chatmeter uses
+    const KEYS = [
+      "nptext", "freeformAnswer", "comment", "text", "reviewText"
+    ];
+
+    for (const d of data) {
+      const name = (d?.name || "").toString().toLowerCase();
+      if (KEYS.includes(name) && d?.value && String(d.value).trim()) {
+        return String(d.value).trim();
+      }
+    }
+
+    // fallback: join any freeform-like values
+    const joined = data
+      .map(d => d?.value)
+      .filter(v => v && String(v).trim())
+      .join(" | ");
+    if (joined) return joined;
+  }
+
+  // 3) Sometimes providers place text under provider-specific fields
+  // (rare in v5, but keep a safety)
+  const provider = normalizeProvider(item?.contentProvider || item?.provider);
+  const maybe = item?.reviewerComment || item?.comment || item?.review;
+  if (maybe && String(maybe).trim()) return String(maybe).trim();
+
+  return ""; // no text found
+}
+
+// --- Build a public URL that agents can click (when Chatmeter gives one)
+function buildPublicUrl(item) {
+  // Chatmeter v5 usually supplies a provider review URL or their review portal URL
+  // Typical fields we’ve seen in real payloads:
+  //   item.reviewURL, item.publicUrl, item.portalUrl
+  const first =
+    item?.reviewURL ||
+    item?.publicUrl ||
+    item?.portalUrl ||
+    "";
+
+  return first ? String(first) : "";
+}
 
 function pickTextFromReview(r) {
   // 1) Direct common fields
