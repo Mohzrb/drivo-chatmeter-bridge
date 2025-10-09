@@ -1,0 +1,28 @@
+{
+  "1001892554": {
+    "location": "EWR",
+    "yelp": "drivo-rent-a-car-newark",
+    "google_url": "https://www.google.com/search?q=Drivo+rent+a+car+EWR#lrd=0x89c252e676fe7d6b:0x252634390a5adf5f,3,,,,"
+  },
+  "1001892551": {
+    "location": "JFK",
+    "yelp": "drivo-rent-a-car-queens",
+    "google_url": "https://www.google.com/search?q=Drivo+rent+a+car+jfk#lrd=0x89c26712df4e59df:0xbf7ff04bb669be10,3,,,,"
+  },
+  "1001892553": {
+    "location": "BRK",
+    "yelp": "drivo-rent-a-car-brooklyn-2",
+    "google_url": "https://www.google.com/search?q=Drivo+rent+a+car+BROOKLYN#lrd=0x89c2455fe962814f:0x8b54a1fbd077eda1,3,,,,"
+  },
+  "1002602673": {
+    "location": "BRKJS"
+  },
+  "1001892552": {
+    "location": "LGA",
+    "yelp": "drivo-rent-a-car-east-elmhurst",
+    "google_url": "https://www.google.com/search?q=Drivo+rent+a+car+Laguardia#lrd=0x89c25f8da1b2ef3d:0x18ee0950bf4e9ae0,3,,,,"
+  },
+  "DRIVO_GLOBAL": {
+    "trustpilot_url": "https://www.trustpilot.com/review/www.drivo.com"
+  }
+}
