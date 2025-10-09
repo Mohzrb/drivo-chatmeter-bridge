@@ -49,11 +49,11 @@ function isJunkComment(s) {
   if (/^★{1,5}$/.test(t)) return true;                              // ★★★★★
   if (/^[0-9]+\/[0-9]+$/.test(t)) return true;                      // 4/5
 
-  // obvious id/token patterns (24+ hex, uuid, long base64-like, no spaces long string)
-  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;                    // hex id (mongo-like)
+  // id/token patterns (24+ hex, uuid, base64-ish, long no-space)
+  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;                    // hex id
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // UUID
-  if (/^[A-Za-z0-9+/_-]{24,}$/.test(t) && !/\s/.test(t)) return true; // token-ish long string
-  if (t.length > 20 && !/\s/.test(t)) return true;                  // very long single token
+  if (/^[A-Za-z0-9+/_-]{24,}$/.test(t) && !/\s/.test(t)) return true;
+  if (t.length > 20 && !/\s/.test(t)) return true;
 
   return false;
 }
@@ -108,7 +108,13 @@ export default async function handler(req, res) {
 
     // ---- comment text (fixes boolean/junk + list-API gaps via detail fetch) ----
     let comment = isNonEmptyString(inBody.text) ? inBody.text.trim() : "";
-    if (!comment || isJunkComment(comment)) {
+
+    // Force detail fetch if provider is REVIEWBUILDER and incoming text is missing/boolean
+    const mustFetch =
+      provider === "REVIEWBUILDER" &&
+      (!isNonEmptyString(comment) || isBooleanString(comment));
+
+    if (!isNonEmptyString(comment) || isJunkComment(comment) || mustFetch) {
       const det = await fetchReviewDetailSmart({
         id: stableReviewKey || reviewId,
         chmBase: CHATMETER_V5_BASE,
@@ -208,13 +214,12 @@ export default async function handler(req, res) {
       const j = JSON.parse(t);
       return res.status(200).json({ ok: true, action: "created", id: j?.ticket?.id, externalId: external_id });
     } else {
-      // Update existing ticket (append one INTERNAL note)
+      // Update existing ticket (no new internal note to avoid duplicates)
       const payload = {
         ticket: {
           external_id,
           tags,
-          custom_fields,
-          comment: { body: note, public: false },
+          custom_fields
         },
       };
       const r = await zSend(`/tickets/${ticketId}.json`, "PUT", payload);
