@@ -1,6 +1,6 @@
 // Poll Chatmeter for recent reviews and forward each to /api/review-webhook
 export default async function handler(req, res) {
-  // Optional: lock this route to Vercel Cron only
+  // Optional: only allow Vercel Cron (Authorization: Bearer <CRON_SECRET>)
   const want = process.env.CRON_SECRET;
   const got = req.headers?.authorization || req.headers?.Authorization;
   if (want && got !== `Bearer ${want}`) {
@@ -9,8 +9,8 @@ export default async function handler(req, res) {
 
   const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
   const CHM_TOKEN = process.env.CHATMETER_V5_TOKEN;          // raw token (no "Bearer")
-  const SELF_BASE = process.env.SELF_BASE_URL;                // e.g., https://drivo-chatmeter-bridge.vercel.app
-  const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15); // default 15 minutes
+  const SELF_BASE = process.env.SELF_BASE_URL;                // e.g. https://drivo-chatmeter-bridge.vercel.app
+  const LOOKBACK  = Number(process.env.POLLER_LOOKBACK_MINUTES || 15); // minutes
 
   const missing = [
     !CHM_TOKEN && "CHATMETER_V5_TOKEN",
@@ -31,8 +31,7 @@ export default async function handler(req, res) {
 
     let posted = 0, skipped = 0, errors = 0;
     for (const it of items) {
-      const id =
-        it?.id ?? it?.reviewId ?? it?.review_id ?? it?.reviewID ?? null;
+      const id = it?.id ?? it?.reviewId ?? it?.review_id ?? it?.reviewID ?? null;
       if (!id) { skipped++; continue; }
 
       const payload = {
