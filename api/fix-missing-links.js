@@ -20,7 +20,7 @@ export default async function handler(req, res) {
       return res.status(500).send("Missing required Zendesk envs.");
     }
 
-    const minutes = +(req.query.minutes || 1440);
+    const minutes = +(req.query.minutes || 1440); // 24h
     const limit   = +(req.query.limit || 200);
     const sinceISO = new Date(Date.now() - minutes*60*1000).toISOString().slice(0,19)+"Z";
     const auth = "Basic " + Buffer.from(`${ZD_EMAIL}/token:${ZD_TOK}`).toString("base64");
@@ -57,6 +57,7 @@ export default async function handler(req, res) {
         const hasText = /<strong>Comment:<\/strong><br>(?!\s*\(no text\))/i.test(body) || /Comment:\s*(?!\(no text\))/i.test(body);
         if (hasText) { skipped++; continue; }
 
+        // get Chatmeter locationId (from custom field or the HTML line "(123456789)")
         let locationId = "";
         const locField = tk.custom_fields?.find(f => /\blocation_id\b/i.test(String(f.id)));
         if (locField?.value) locationId = String(locField.value);
