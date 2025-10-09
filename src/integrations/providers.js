@@ -6,11 +6,9 @@ let _map = null;
 function loadProviderMap() {
   if (_map) return _map;
 
+  // optional env override
   if (process.env.PROVIDER_IDS_JSON) {
-    try {
-      _map = JSON.parse(process.env.PROVIDER_IDS_JSON);
-      return _map;
-    } catch {}
+    try { _map = JSON.parse(process.env.PROVIDER_IDS_JSON); return _map; } catch {}
   }
 
   try {
@@ -19,7 +17,6 @@ function loadProviderMap() {
   } catch {
     _map = {};
   }
-
   return _map;
 }
 
@@ -27,20 +24,18 @@ export function getLocEntry(locationId) {
   const m = loadProviderMap();
   return m?.[String(locationId)] || null;
 }
-
 export function getGlobalEntry() {
   const m = loadProviderMap();
   return m?.DRIVO_GLOBAL || null;
 }
 
+// URL builders (link-first, compliant)
 export function yelpUrlFromAlias(alias) {
   return alias ? `https://www.yelp.com/biz/${encodeURIComponent(alias)}` : null;
 }
-
 export function googleReviewsUrlFromConfig(entry) {
   return entry?.google_url || null;
 }
-
 export function trustpilotUrlFromConfig(entry, globalEntry) {
   return entry?.trustpilot_url || globalEntry?.trustpilot_url || null;
 }
