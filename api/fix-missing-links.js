@@ -57,7 +57,7 @@ export default async function handler(req, res) {
         const hasText = /<strong>Comment:<\/strong><br>(?!\s*\(no text\))/i.test(body) || /Comment:\s*(?!\(no text\))/i.test(body);
         if (hasText) { skipped++; continue; }
 
-        // get Chatmeter locationId (from custom field or the HTML line "(123456789)")
+        // locationId from custom field or "(123456789)" in the HTML line
         let locationId = "";
         const locField = tk.custom_fields?.find(f => /\blocation_id\b/i.test(String(f.id)));
         if (locField?.value) locationId = String(locField.value);
