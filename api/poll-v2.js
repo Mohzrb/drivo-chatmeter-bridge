@@ -1,11 +1,10 @@
-// /api/poll-v2.js
 export default async function handler(req, res) {
   try {
     // --- auth: require CRON_SECRET unless you're testing locally
     const want = process.env.CRON_SECRET;
     const got = req.headers.authorization || "";
     if (want && got !== `Bearer ${want}`) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-08" });
+      return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-09" });
     }
 
     const CHM_BASE  = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
@@ -22,7 +21,7 @@ export default async function handler(req, res) {
     const enrich    = true;
     const requireText = (req.query.requireText ?? "1") !== "0";
 
-    // location name map (optional)
+    // location name map (optional, JSON string in env)
     let LOCMAP = {};
     try { LOCMAP = JSON.parse(process.env.CHM_LOCATION_MAP || "{}"); } catch {}
 
@@ -38,7 +37,7 @@ export default async function handler(req, res) {
     if (clientId)  qs.set("clientId", clientId);
 
     const url = `${CHM_BASE}/reviews?${qs.toString()}`;
-    const list = await jf(url, { headers: { Authorization: CHM_TOKEN }});
+    const list = await jf(url, { headers: { Authorization: CHM_TOKEN } });
     const items = Array.isArray(list?.reviews) ? list.reviews : (Array.isArray(list) ? list : []);
 
     let posted = 0, skipped = 0, errors = 0, checked = 0;
@@ -52,7 +51,7 @@ export default async function handler(req, res) {
       if (enrich) {
         try {
           const durl = `${CHM_BASE}/reviews/${encodeURIComponent(id)}`;
-          detail = await jf(durl, { headers: { Authorization: CHM_TOKEN }});
+          detail = await jf(durl, { headers: { Authorization: CHM_TOKEN } });
         } catch { /* keep list item as fallback */ }
       }
 
@@ -88,7 +87,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      version: "poller-v2-2025-10-08",
+      version: "poller-v2-2025-10-09",
       since: sinceIso,
       used_accountId: accountId || null,
       used_groupId: groupId || null,
@@ -109,7 +108,7 @@ async function jf(url, opt) {
   try { return JSON.parse(t); } catch { return {}; }
 }
 
-// robust text extraction across providers
+// robust text extraction across providers (enhanced)
 function extractText(obj) {
   if (!obj || typeof obj !== "object") return "";
   const p = (obj.contentProvider || obj.provider || "").toUpperCase();
@@ -128,10 +127,15 @@ function extractText(obj) {
     if (joined) return joined;
   }
 
-  // Common fields for Google/Yelp/Trustpilot/Facebook
+  // Common fields for Google/Yelp/Trustpilot/Facebook & aggregators
   const candidates = [
     obj.comment, obj.text, obj.reviewText, obj.body, obj.content, obj.reviewerComment,
-  ].map(x => (typeof x === "string" ? x.trim() : "")).filter(Boolean);
+    obj.snippet, obj.description, obj.message, obj.originalText, obj.textOriginal,
+    obj.plainText, obj.review
+  ]
+  .map(x => (typeof x === "string" ? x.trim() : ""))
+  .filter(Boolean);
+
   if (candidates.length) {
     // pick the longest non-linky string
     candidates.sort((a,b)=>b.length-a.length);
