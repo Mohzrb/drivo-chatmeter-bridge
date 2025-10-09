@@ -1,5 +1,8 @@
 {
   "crons": [
-    { "path": "/api/poll-v2?minutes=60&enrich=1&requireText=1", "schedule": "*/15 * * * *" }
+    {
+      "path": "/api/fix-missing?minutes=1440&limit=400",
+      "schedule": "0 6 * * *"
+    }
   ]
 }
