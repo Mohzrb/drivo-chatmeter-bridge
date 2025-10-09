@@ -1,5 +1,6 @@
 // /api/_helpers.js
 
+/** Basic string guards */
 export const isNonEmptyString = (x) =>
   typeof x === "string" && x.trim().length > 0;
 
@@ -19,25 +20,33 @@ const looksLikeRating = (x) => {
   return false;
 };
 
-/** Extract best free-text from ReviewBuilder reviewData */
+/** Extract best free-text from ReviewBuilder/Survey reviewData */
 export function extractRBText(review) {
   const rows = Array.isArray(review?.reviewData) ? review.reviewData : [];
   const keep = [];
 
   for (const r of rows) {
-    const v = r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
+    const v =
+      r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
     if (!isNonEmptyString(v)) continue;
     if (isBooleanString(v)) continue;
     if (looksLikeRating(v)) continue;
 
     const name = String(r?.name || "").toLowerCase();
-    const boost = /open|own\s*words|comment|verbatim|describe|feedback|text/.test(name) ? 1 : 0;
+    const boost = /open|own\s*words|comment|verbatim|describe|feedback|text/.test(
+      name
+    )
+      ? 1
+      : 0;
+
     keep.push({ text: v.trim(), boost, len: v.trim().length });
   }
+
   if (!keep.length) return "";
+
   keep.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
 
-  // de-dupe & limit
+  // de-dupe & cap
   const seen = new Set();
   const out = [];
   for (const k of keep) {
@@ -50,9 +59,16 @@ export function extractRBText(review) {
   return out.join("\n\n");
 }
 
-/** Provider-agnostic text getter (works for Google/Yelp/TP/FB/ReviewBuilder/Surveys) */
+/** Provider-agnostic text getter (Google/Yelp/TP/FB/ReviewBuilder/Surveys) */
 export function getProviderComment(providerInput, review) {
-  const provider = (providerInput || review?.contentProvider || review?.provider || "").toString().toUpperCase();
+  const provider = (
+    providerInput ||
+    review?.contentProvider ||
+    review?.provider ||
+    ""
+  )
+    .toString()
+    .toUpperCase();
 
   // direct text first
   const direct =
@@ -67,11 +83,20 @@ export function getProviderComment(providerInput, review) {
   if (provider === "REVIEWBUILDER" || provider === "SURVEYS") {
     const rb = extractRBText(review);
     if (isNonEmptyString(rb)) return rb;
-    if (isNonEmptyString(direct) && !isBooleanString(direct) && !looksLikeRating(direct)) return direct.trim();
+    if (
+      isNonEmptyString(direct) &&
+      !isBooleanString(direct) &&
+      !looksLikeRating(direct)
+    )
+      return direct.trim();
     return "";
   }
 
-  if (isNonEmptyString(direct) && !isBooleanString(direct) && !looksLikeRating(direct)) {
+  if (
+    isNonEmptyString(direct) &&
+    !isBooleanString(direct) &&
+    !looksLikeRating(direct)
+  ) {
     return direct.trim();
   }
 
@@ -82,10 +107,10 @@ export function getProviderComment(providerInput, review) {
     if (typeof o === "string") {
       const s = o.trim();
       if (!s) return;
-      if (/^https?:\/\//i.test(s)) return;          // skip links
-      if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return;     // skip ISO date
-      if (isBooleanString(s)) return;                // skip true/false
-      if (looksLikeRating(s)) return;                // skip "5", "NPS: 9"
+      if (/^https?:\/\//i.test(s)) return; // skip links
+      if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return; // skip ISO date
+      if (isBooleanString(s)) return; // skip true/false
+      if (looksLikeRating(s)) return; // skip "5", "NPS: 9"
       if (s.length > best.length) best = s;
       return;
     }
@@ -96,32 +121,45 @@ export function getProviderComment(providerInput, review) {
   return best;
 }
 
+/** Stars helper (no empty/outline needed in the note) */
 export const stars = (n) => {
   const x = Math.max(0, Math.min(5, Number(n) || 0));
   return "★".repeat(x);
 };
 
+/** Normalize provider labels to a stable set */
 export function normalizeProvider(p) {
   const v = (p || "").toString().trim().toUpperCase();
   const MAP = {
-    "GOOGLE MAPS": "GOOGLE", "GMAPS": "GOOGLE",
+    "GOOGLE MAPS": "GOOGLE",
+    GMAPS: "GOOGLE",
     "TRUST PILOT": "TRUSTPILOT",
-    "META": "FACEBOOK", "FB": "FACEBOOK",
-    "MICROSOFT": "BING"
+    META: "FACEBOOK",
+    FB: "FACEBOOK",
+    MICROSOFT: "BING",
   };
   return MAP[v] || v;
 }
 
-/** Build the INTERNAL card exactly like your screenshot (plus optional link) */
+/** Build the INTERNAL note exactly like your structure, with a markdown link */
 export function buildInternalNote({
-  dt, customerName, customerEmail, customerPhone,
-  provider, locationName, locationId, rating, comment, viewUrl
+  dt,
+  customerName,
+  customerEmail,
+  customerPhone,
+  provider,
+  locationName,
+  locationId,
+  rating,
+  comment,
+  viewUrl,
 }) {
   const lines = [
-    "Review Information:",
+    "Review Information",
     "",
     `Date: ${dt || "-"}`,
   ];
+
   if (customerName || customerEmail || customerPhone) {
     lines.push(
       `Customer: ${customerName || "-"}`,
@@ -129,26 +167,32 @@ export function buildInternalNote({
       customerPhone ? String(customerPhone).trim() : null
     );
   }
+
   lines.push(
-    "",
-    `Location: ${locationName ? `${locationName}` : "Unknown"}${locationId ? "" : ""}`
-  );
-  lines.push(
+    `Provider: ${provider || "-"}`,
+    `Location: ${
+      locationName ? `${locationName} (${locationId || "-"})` : locationId || "-"
+    }`,
+    `Rating: ${"★".repeat(Math.max(0, Math.min(5, Number(rating) || 0)))}`,
     "",
     "Comment:",
     isNonEmptyString(comment) ? comment : "(no text)",
     ""
   );
-  if (isNonEmptyString(viewUrl)) lines.push("View in Chatmeter");
+
+  if (isNonEmptyString(viewUrl)) {
+    lines.push(`[View in Chatmeter](${viewUrl})`);
+  }
+
   lines.push(
     "",
-    "The first comment on this ticket will be recorded as your response to Chatmeter. Any messages after will not be sent and you can work the ticket as normal."
+    "The first public comment on this ticket will be posted to Chatmeter."
   );
 
-  return lines.filter((x) => x !== null).join("\n");
+  return lines.filter(Boolean).join("\n");
 }
 
-/** pick best email / phone if present */
+/** Pick best customer contact fields if present */
 export function pickCustomerContact(o = {}) {
   const email =
     o.reviewerEmail || o.authorEmail || o.email || o.customerEmail || "";
@@ -157,6 +201,6 @@ export function pickCustomerContact(o = {}) {
 
   return {
     email: isNonEmptyString(email) ? String(email).trim() : "",
-    phone: isNonEmptyString(phone) ? String(phone).trim() : ""
+    phone: isNonEmptyString(phone) ? String(phone).trim() : "",
   };
 }
