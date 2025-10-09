@@ -110,9 +110,10 @@ export default async function handler(req, res) {
     let comment = isNonEmptyString(inBody.text) ? inBody.text.trim() : "";
 
     // Force detail fetch if provider is REVIEWBUILDER and incoming text is missing/boolean
-    const mustFetch =
-      provider === "REVIEWBUILDER" &&
-      (!isNonEmptyString(comment) || isBooleanString(comment));
+ const mustFetch =
+  provider === "REVIEWBUILDER" &&
+  (!isNonEmptyString(comment) || isBooleanString(comment) || comment.trim().toLowerCase() === "false" || comment.trim().toLowerCase() === "true");
+
 
     if (!isNonEmptyString(comment) || isJunkComment(comment) || mustFetch) {
       const det = await fetchReviewDetailSmart({
