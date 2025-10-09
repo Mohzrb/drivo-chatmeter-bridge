@@ -1,3 +1,4 @@
+// /api/fix-missing.js
 export default async function handler(req, res) {
   try {
     const want = process.env.CRON_SECRET;
@@ -94,7 +95,7 @@ export default async function handler(req, res) {
   }
 }
 
-// shared helpers (same logic as poll-v2, enhanced)
+// shared helpers (same logic as poll-v2)
 function extractText(obj) {
   if (!obj || typeof obj !== "object") return "";
   const p = (obj.contentProvider || obj.provider || "").toUpperCase();
@@ -112,8 +113,6 @@ function extractText(obj) {
   }
   const candidates = [
     obj.comment, obj.text, obj.reviewText, obj.body, obj.content, obj.reviewerComment,
-    obj.snippet, obj.description, obj.message, obj.originalText, obj.textOriginal,
-    obj.plainText, obj.review
   ].map(x => (typeof x === "string" ? x.trim() : "")).filter(Boolean);
   if (candidates.length) { candidates.sort((a,b)=>b.length-a.length); return candidates.find(s=>!/^https?:\/\//i.test(s)) || candidates[0]; }
   let best = "";
