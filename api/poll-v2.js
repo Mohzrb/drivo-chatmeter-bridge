@@ -1,130 +1,96 @@
-// ... keep your imports/env reads
+// /api/poll-v2.js
+// Pull from Chatmeter v5 and forward normalized items to /api/review-webhook
 
-// --- Add these helpers near the top ---
-function isGoodText(v) {
-  if (v == null) return false;
-  const s = String(v).trim();
-  if (!s) return false;
-  // Don’t mistake hex-like IDs for comments
-  if (/^[a-f0-9]{24}$/i.test(s)) return false;
-  return true;
-}
-// --- Provider normalization (Chatmeter can vary names per source)
-function normalizeProvider(p) {
-  const v = (p || "").toString().trim().toUpperCase();
-  if (!v) return "";
+import { getProviderComment } from "./_helpers.js";
 
-  // Map common variants to a single label
-  const MAP = {
-    "GOOGLE": "GOOGLE",
-    "GOOGLE MAPS": "GOOGLE",
-    "GMAPS": "GOOGLE",
-    "YELP": "YELP",
-    "TRUSTPILOT": "TRUSTPILOT",
-    "TRUST PILOT": "TRUSTPILOT",
-    "FACEBOOK": "FACEBOOK",
-    "META": "FACEBOOK",
-    "FB": "FACEBOOK",
-    "BING": "BING",
-    "MICROSOFT": "BING",
-    "REVIEWBUILDER": "REVIEWBUILDER",
-    "SURVEYS": "SURVEYS"
-  };
+export default async function handler(req, res) {
+  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
 
-  return MAP[v] || v; // fall back to the raw upper value
-}
+  const CHM_BASE   = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
+  const CHM_TOKEN  = process.env.CHATMETER_V5_TOKEN;           // raw token (no "Bearer")
+  const SELF_BASE  = process.env.SELF_BASE_URL;                 // your Vercel base URL
+  const CRON_SECRET = process.env.CRON_SECRET;                  // protect the poller
 
-// --- Extract a readable text/comment across ALL providers (incl. surveys)
-function extractReviewText(item) {
-  // 1) direct text if present
-  if (item?.text && String(item.text).trim()) return String(item.text).trim();
-
-  // 2) Chatmeter sometimes sends "reviewData" with survey/NPX answers
-  //    Look for commonly used keys and take the first non-empty free text.
-  const data = Array.isArray(item?.reviewData) ? item.reviewData : [];
-  if (data.length) {
-    // Look for typical free-form answers Chatmeter uses
-    const KEYS = [
-      "nptext", "freeformAnswer", "comment", "text", "reviewText"
-    ];
-
-    for (const d of data) {
-      const name = (d?.name || "").toString().toLowerCase();
-      if (KEYS.includes(name) && d?.value && String(d.value).trim()) {
-        return String(d.value).trim();
-      }
-    }
-
-    // fallback: join any freeform-like values
-    const joined = data
-      .map(d => d?.value)
-      .filter(v => v && String(v).trim())
-      .join(" | ");
-    if (joined) return joined;
+  // simple auth
+  const got = req.headers?.authorization || req.headers?.Authorization;
+  if (CRON_SECRET && got !== `Bearer ${CRON_SECRET}`) {
+    return res.status(401).json({ ok: false, error: "Unauthorized", version: "poller-v2-2025-10-08" });
   }
 
-  // 3) Sometimes providers place text under provider-specific fields
-  // (rare in v5, but keep a safety)
-  const provider = normalizeProvider(item?.contentProvider || item?.provider);
-  const maybe = item?.reviewerComment || item?.comment || item?.review;
-  if (maybe && String(maybe).trim()) return String(maybe).trim();
+  const minutes  = Number(req.query.minutes || 1440);  // default 24h
+  const maxItems = Number(req.query.max || 50);
+  const dryRun   = String(req.query.dry || "").toLowerCase() === "1";
+  const accountId = req.query.accountId || process.env.CHM_ACCOUNT_ID || "";
+  const groupId   = req.query.groupId   || "";
 
-  return ""; // no text found
-}
+  const missing = [
+    !CHM_TOKEN && "CHATMETER_V5_TOKEN",
+    !SELF_BASE && "SELF_BASE_URL",
+  ].filter(Boolean);
+  if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
-// --- Build a public URL that agents can click (when Chatmeter gives one)
-function buildPublicUrl(item) {
-  // Chatmeter v5 usually supplies a provider review URL or their review portal URL
-  // Typical fields we’ve seen in real payloads:
-  //   item.reviewURL, item.publicUrl, item.portalUrl
-  const first =
-    item?.reviewURL ||
-    item?.publicUrl ||
-    item?.portalUrl ||
-    "";
+  const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+  const query = new URLSearchParams({
+    limit: String(maxItems),
+    sortField: "reviewDate",
+    sortOrder: "DESC",
+    updatedSince: sinceIso
+  });
+  if (accountId) query.set("accountId", accountId);
+  if (groupId)   query.set("groupId", groupId);
 
-  return first ? String(first) : "";
-}
+  try {
+    const r = await fetch(`${CHM_BASE}/reviews?${query.toString()}`, {
+      headers: { Authorization: CHM_TOKEN }
+    });
+    const rawText = await r.text();
+    if (!r.ok) return res.status(502).send(`Chatmeter list error: ${r.status} ${rawText}`);
 
-function pickTextFromReview(r) {
-  // 1) Direct common fields
-  const direct = [
-    r.text, r.reviewText, r.comment, r.body, r.content, r.message, r.review_body
-  ].find(isGoodText);
-  if (isGoodText(direct)) return String(direct).trim();
+    const payload = JSON.parse(rawText);
+    const list = Array.isArray(payload?.reviews) ? payload.reviews
+              : Array.isArray(payload)           ? payload
+              : Array.isArray(payload?.results)  ? payload.results
+              : [];
 
-  // 2) reviewData[] style (Chatmeter often places survey/vendor text here)
-  const rows = Array.isArray(r.reviewData) ? r.reviewData : (Array.isArray(r.data) ? r.data : []);
-  for (const it of rows) {
-    const key = String(it.name || it.key || '').toLowerCase();
-    const val = it.value ?? it.text ?? it.detail ?? '';
-    if (!isGoodText(val)) continue;
-    if (/(comment|comments|review|review[_ ]?text|text|body|content|np_comment|free.*text|description)/.test(key)) {
-      return String(val).trim();
+    let posted = 0, skipped = 0;
+
+    for (const it of list) {
+      const provider = (it.contentProvider || it.provider || "").toUpperCase();
+      const norm = {
+        id: it.id || it.reviewId || it.providerReviewId,
+        provider,
+        locationId: it.locationId || "",
+        locationName: it.locationName || "",
+        rating: Number(it.rating || it.stars || 0),
+        authorName: it.reviewerUserName || it.reviewer || it.author || "",
+        authorEmail: it.reviewerEmail || "",
+        createdAt: it.reviewDate || it.createdAt || new Date().toISOString(),
+        text: getProviderComment(provider, it),
+        publicUrl: it.reviewURL || it.publicUrl || it.portalUrl || ""
+      };
+      if (!norm.id) { skipped++; continue; }
+
+      if (dryRun) { posted++; continue; } // simulate
+
+      const r2 = await fetch(`${SELF_BASE}/api/review-webhook`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(norm)
+      });
+      if (r2.ok) posted++; else skipped++;
     }
+
+    return res.status(200).json({
+      ok: true,
+      version: "poller-v2-2025-10-08",
+      echo: {
+        minutes, clientId: "", accountId, groupId, dry: dryRun, maxItems
+      },
+      since: sinceIso,
+      checked: list.length,
+      posted, skipped, errors: 0
+    });
+  } catch (e) {
+    return res.status(500).send(`Error: ${e?.message || e}`);
   }
-
-  // 3) Nothing found
-  return '';
 }
-
-function pickPublicUrl(r) {
-  // Prefer public URL; otherwise use whatever is available
-  return r.publicUrl || r.reviewURL || r.portalUrl || '';
-}
-
-// --- inside your handler loop where you build payload for /api/review-webhook ---
-const payload = {
-  id: id,
-  provider: it.contentProvider || it.provider || '',
-  locationId: it.locationId ?? '',
-  locationName: it.locationName ?? inferLocName(it.locationId),
-  rating: it.rating ?? 0,
-  authorName: it.reviewerUserName || it.authorName || 'Reviewer',
-  authorEmail: it.reviewerEmail || it.authorEmail || 'reviews@drivo.com',
-  createdAt: it.reviewDate || it.createdAt || '',
-  text: pickTextFromReview(it),                 // <- use new extractor
-  publicUrl: pickPublicUrl(it),                 // <- stable link
-  portalUrl: it.portalUrl || ''
-};
-// ... send payload to /api/review-webhook as before
