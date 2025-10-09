@@ -1,62 +1,62 @@
 // /api/_helpers.js
-// Utility helpers for Chatmeter ⇄ Zendesk bridge
+// Unified helper for Chatmeter → Zendesk bridge (2025-10-10)
 
-/** ---------- basic guards ---------- */
-export const isNonEmptyString = (x) =>
-  typeof x === "string" && x.trim().length > 0;
+export function isNonEmptyString(x) {
+  return typeof x === "string" && x.trim().length > 0;
+}
 
-export const isBooleanString = (x) => {
+export function isBooleanString(x) {
   if (!isNonEmptyString(x)) return false;
   const t = x.trim().toLowerCase();
   return t === "true" || t === "false";
-};
+}
 
-/** numbers/stars/fractions/NPS that are not real comments */
 function looksLikeRating(x) {
   if (!isNonEmptyString(x)) return false;
   const t = x.trim();
-  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;           // 5 or 4.0
-  if (/^★{1,5}$/.test(t)) return true;                      // ★★★★★
-  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;              // 4/5
-  if (/^nps[:\s]/i.test(t)) return true;                    // NPS: 9
-  return false;
+  return (
+    /^[0-9]+(\.[0-9]+)?$/.test(t) || // 5, 4.0
+    /^★{1,5}$/.test(t) ||            // ★★★★
+    /^[0-9]+\/[0-9]+$/.test(t) ||    // 4/5
+    /^nps[:\s]/i.test(t)             // NPS: 9
+  );
 }
 
-/** junk tokens we never want as a comment (urls, ids, uuids, encoded hashes, etc.) */
+/**
+ * Detect "junk" strings (hashes, booleans, timestamps, etc.)
+ * Yelp sometimes gives 24-char hashes — filter them cleanly.
+ */
 function isJunkText(s) {
   if (!isNonEmptyString(s)) return true;
   const t = s.trim();
 
-  // obvious junk
-  if (isBooleanString(t)) return true;                      // true / false
-  if (/^https?:\/\//i.test(t)) return true;                 // URL
-  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;           // ISO date/time
-  if (looksLikeRating(t)) return true;                      // 5, 4/5, ★★★★☆
+  if (isBooleanString(t)) return true;
+  if (/^https?:\/\//i.test(t)) return true;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;
+  if (looksLikeRating(t)) return true;
 
-  // ids / uuids
-  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;            // 24+ hex (mongo-like)
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // UUID
+  // Mongo-style hex ID
+  if (/^[A-Fa-f0-9]{24}$/.test(t)) return true;
 
-  // Yelp/Google often return base64-ish or hex-like tokens when no text is available.
-  // Treat as junk only if it's a long no-space string with *no vowels* (to avoid killing real short words).
-  if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t)) return true;
+  // Base64-like hash (Yelp/Google)
+  if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t))
+    return true;
 
   return false;
 }
 
-/** ---------- ReviewBuilder / Surveys free-text extraction ---------- */
+/** Extract meaningful free-text from ReviewBuilder survey answers */
 export function extractRBText(review) {
   const rows = Array.isArray(review?.reviewData) ? review.reviewData : [];
-  const candidates = [];
+  const out = [];
 
   for (const r of rows) {
     const v =
       r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
     if (!isNonEmptyString(v)) continue;
 
-    const val = String(v).trim();
-    if (isBooleanString(val)) continue;
-    if (looksLikeRating(val)) continue;
+    const val = v.trim();
+    if (isBooleanString(val) || looksLikeRating(val) || isJunkText(val)) continue;
 
     const name = String(r?.name || "").toLowerCase();
     const boost = /open|own\s*words|comment|verbatim|describe|feedback|text/.test(
@@ -65,75 +65,77 @@ export function extractRBText(review) {
       ? 1
       : 0;
 
-    candidates.push({ text: val, boost, len: val.length });
+    out.push({ text: val, boost, len: val.length });
   }
 
-  if (!candidates.length) return "";
+  if (!out.length) return "";
+  out.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
 
-  candidates.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
-
-  // de-dupe & cap
   const seen = new Set();
-  const out = [];
-  for (const c of candidates) {
-    const k = c.text.toLowerCase();
-    if (seen.has(k)) continue;
-    out.push(c.text);
-    seen.add(k);
-    if (out.length >= 3) break;
+  const chosen = [];
+  for (const c of out) {
+    const key = c.text.toLowerCase();
+    if (seen.has(key)) continue;
+    chosen.push(c.text);
+    seen.add(key);
+    if (chosen.length >= 3) break;
   }
-  return out.join("\n\n");
+  return chosen.join("\n\n");
 }
 
-/** ---------- Provider-agnostic comment getter ---------- */
-export function getProviderComment(providerInput, review) {
-  const provider = (
-    providerInput ||
-    review?.contentProvider ||
-    review?.provider ||
-    ""
-  )
-    .toString()
-    .toUpperCase();
+/** Normalize provider names (Google Maps → GOOGLE, etc.) */
+export function normalizeProvider(p) {
+  const v = (p || "").toString().trim().toUpperCase();
+  const MAP = {
+    "GOOGLE MAPS": "GOOGLE",
+    GMAPS: "GOOGLE",
+    META: "FACEBOOK",
+    FB: "FACEBOOK",
+    "TRUST PILOT": "TRUSTPILOT",
+  };
+  return MAP[v] || v;
+}
 
-  // 1) Provider-specific (ReviewBuilder / Surveys)
+/** Best-effort comment extractor for all providers */
+export function getProviderComment(providerInput, review) {
+  const provider = normalizeProvider(
+    providerInput || review?.contentProvider || review?.provider || ""
+  );
+
+  // ReviewBuilder first
   if (provider === "REVIEWBUILDER" || provider === "SURVEYS") {
     const rb = extractRBText(review);
-    if (isNonEmptyString(rb) && !isJunkText(rb)) return rb;
-    // fall through to generic direct fields if RB had nothing
+    if (isNonEmptyString(rb)) return rb;
   }
 
-  // 2) Common direct locations used by Google / Yelp / FB / TP and RB fallbacks
-  const directFields = [
-    review?.text,
+  // Direct fields
+  const direct = [
     review?.comment,
-    review?.body,
     review?.reviewText,
+    review?.text,
+    review?.body,
     review?.review,
-    review?.reviewerComment,
   ]
-    .map((x) => (typeof x === "string" ? x.trim() : ""))
-    .filter(Boolean)
-    .filter((s) => !isJunkText(s));
+    .map((x) => (isNonEmptyString(x) ? x.trim() : ""))
+    .filter((s) => s && !isJunkText(s));
 
-  if (directFields.length) {
-    // prefer the longest meaningful string
-    directFields.sort((a, b) => b.length - a.length);
-    return directFields[0];
+  if (direct.length) {
+    direct.sort((a, b) => b.length - a.length);
+    return direct[0];
   }
 
-  // 3) Some providers accidentally stuff things into reviewData values
+  // Fallback: scan reviewData if present
   if (Array.isArray(review?.reviewData)) {
-    const rdVals = review.reviewData
-      .map((r) => (isNonEmptyString(r?.value) ? String(r.value).trim() : ""))
-      .filter((s) => s && !isJunkText(s));
-    if (rdVals.length) {
-      rdVals.sort((a, b) => b.length - a.length);
-      return rdVals[0];
+    const rd = review.reviewData
+      .map((r) => (isNonEmptyString(r?.value) ? r.value.trim() : ""))
+      .filter((v) => v && !isJunkText(v));
+    if (rd.length) {
+      rd.sort((a, b) => b.length - a.length);
+      return rd[0];
     }
   }
 
-  // 4) Deep scan as last resort (skip urls/dates/booleans/ratings/junk)
+  // Final deep scan
   let best = "";
   (function scan(o) {
     if (!o) return;
@@ -150,38 +152,24 @@ export function getProviderComment(providerInput, review) {
   return best || "";
 }
 
-/** ---------- Formatting helpers ---------- */
-export function stars(n) {
-  const x = Math.max(0, Math.min(5, Number(n) || 0));
-  return "★".repeat(x) + "☆".repeat(5 - x);
-}
-
-export function normalizeProvider(p) {
-  const v = (p || "").toString().trim().toUpperCase();
-  const MAP = {
-    "GOOGLE MAPS": "GOOGLE",
-    GMAPS: "GOOGLE",
-    "TRUST PILOT": "TRUSTPILOT",
-    META: "FACEBOOK",
-    FB: "FACEBOOK",
-    MICROSOFT: "BING",
-  };
-  return MAP[v] || v;
-}
-
-/** pick best customer contact fields if present */
+/** Customer contact fields */
 export function pickCustomerContact(o = {}) {
   const email =
     o.reviewerEmail || o.authorEmail || o.email || o.customerEmail || "";
   const phone =
     o.reviewerPhone || o.authorPhone || o.phone || o.customerPhone || "";
   return {
-    email: isNonEmptyString(email) ? String(email).trim() : "",
-    phone: isNonEmptyString(phone) ? String(phone).trim() : "",
+    email: isNonEmptyString(email) ? email.trim() : "",
+    phone: isNonEmptyString(phone) ? phone.trim() : "",
   };
 }
 
-/** Build INTERNAL note exactly like your structure (with markdown link) */
+export function stars(n) {
+  const x = Math.max(0, Math.min(5, Number(n) || 0));
+  return "★".repeat(x) + "☆".repeat(5 - x);
+}
+
+/** Build internal note formatted for Zendesk */
 export function buildInternalNote({
   dt,
   customerName,
@@ -209,22 +197,21 @@ export function buildInternalNote({
     "",
   ];
 
-  if (isNonEmptyString(viewUrl)) {
+  if (isNonEmptyString(viewUrl))
     lines.push(`[View in Chatmeter](${viewUrl})`);
-  }
 
   lines.push(
     "",
     "_The first public comment on this ticket will be posted to Chatmeter._"
   );
 
-  // optionally include contact (on separate lines below “Customer”)
-  const contactLines = [];
-  if (isNonEmptyString(customerEmail)) contactLines.push(customerEmail.trim());
-  if (isNonEmptyString(customerPhone)) contactLines.push(customerPhone.trim());
-  if (contactLines.length) {
-    // insert right after Customer line
-    lines.splice(4, 0, ...contactLines);
+  if (isNonEmptyString(customerEmail) || isNonEmptyString(customerPhone)) {
+    lines.splice(
+      4,
+      0,
+      ...(isNonEmptyString(customerEmail) ? [customerEmail.trim()] : []),
+      ...(isNonEmptyString(customerPhone) ? [customerPhone.trim()] : [])
+    );
   }
 
   return lines.filter(Boolean).join("\n");
