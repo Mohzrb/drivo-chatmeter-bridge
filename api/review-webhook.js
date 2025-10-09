@@ -1,22 +1,23 @@
 // /api/review-webhook.js
 // Chatmeter -> Zendesk: create/update ticket with ONE INTERNAL card.
-// If incoming text is empty/boolean, fetch Chatmeter review detail to extract proper text.
+// If incoming text is empty/boolean/junk, fetch Chatmeter review detail to extract proper text.
+// Stable external_id prevents duplicate tickets across subsequent syncs.
 
 import {
   getProviderComment,
   buildInternalNote,
   isNonEmptyString,
+  isBooleanString,
   normalizeProvider,
   pickCustomerContact,
 } from "./_helpers.js";
 
-/** Try multiple ID/path variants to retrieve review detail (handles ReviewBuilder) */
+/** Try multiple ID/path variants to retrieve review detail (handles ReviewBuilder path too) */
 async function fetchReviewDetailSmart({ id, chmBase, token, accountId }) {
   if (!id || !token) return null;
   const headers = { Authorization: token };
   const idStr = String(id);
 
-  // Try canonical and ReviewBuilder paths
   const paths = [
     `/reviews/${encodeURIComponent(idStr)}`,
     `/reviewBuilder/reviews/${encodeURIComponent(idStr)}`,
@@ -30,11 +31,31 @@ async function fetchReviewDetailSmart({ id, chmBase, token, accountId }) {
       const t = await r.text();
       if (!r.ok) continue;
       try { return JSON.parse(t); } catch { return {}; }
-    } catch {
-      // ignore and try next
-    }
+    } catch { /* try next */ }
   }
   return null;
+}
+
+/** Heuristic to reject "junk" comments: booleans, ids, tokens, urls, dates, ratings */
+function isJunkComment(s) {
+  if (!isNonEmptyString(s)) return true;
+  const t = s.trim();
+
+  // obvious skips
+  if (isBooleanString(t)) return true;                              // true / false
+  if (/^https?:\/\//i.test(t)) return true;                         // URL only
+  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;                   // ISO date
+  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;                   // 5 or 4.0
+  if (/^★{1,5}$/.test(t)) return true;                              // ★★★★★
+  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;                      // 4/5
+
+  // obvious id/token patterns (24+ hex, uuid, long base64-like, no spaces long string)
+  if (/^[A-Fa-f0-9]{24,}$/.test(t)) return true;                    // hex id (mongo-like)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // UUID
+  if (/^[A-Za-z0-9+/_-]{24,}$/.test(t) && !/\s/.test(t)) return true; // token-ish long string
+  if (t.length > 20 && !/\s/.test(t)) return true;                  // very long single token
+
+  return false;
 }
 
 export default async function handler(req, res) {
@@ -47,8 +68,8 @@ export default async function handler(req, res) {
     ZD_FIELD_REVIEW_ID,
     ZD_FIELD_LOCATION_ID,
     ZD_FIELD_RATING,
-    ZD_FIELD_FIRST_REPLY_SENT,      // not used here; kept for consistency
-    ZD_FIELD_LOCATION_NAME,         // optional
+    ZD_FIELD_FIRST_REPLY_SENT, // not used here; retained for compatibility
+    ZD_FIELD_LOCATION_NAME,    // optional
     CHATMETER_V5_BASE = "https://live.chatmeter.com/v5",
     CHATMETER_V5_TOKEN,
     CHM_ACCOUNT_ID = process.env.CHM_ACCOUNT_ID || "",
@@ -69,7 +90,13 @@ export default async function handler(req, res) {
   try {
     const inBody = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
 
-    const reviewId     = inBody.id || inBody.reviewId || inBody.providerReviewId;
+    // Prefer providerReviewId for stability; fallback to id/reviewId
+    const rawProviderReviewId = inBody.providerReviewId || inBody.provider_review_id;
+    const rawId               = inBody.id || inBody.reviewId;
+    const stableReviewKey     = String(rawProviderReviewId || rawId || "");
+
+    // Still carry individual values for fields
+    const reviewId     = rawId || rawProviderReviewId || ""; // for custom field display
     const provider     = normalizeProvider(inBody.provider || inBody.contentProvider || "");
     const locationId   = String(inBody.locationId || "");
     const locationName = String(inBody.locationName || "");
@@ -79,17 +106,20 @@ export default async function handler(req, res) {
     const publicUrl    = inBody.publicUrl || inBody.reviewURL || inBody.portalUrl || "";
     const contactIn    = pickCustomerContact(inBody); // { email, phone }
 
-    // ---- comment text (fixes boolean "true/false" and list-API gaps) ----
+    // ---- comment text (fixes boolean/junk + list-API gaps via detail fetch) ----
     let comment = isNonEmptyString(inBody.text) ? inBody.text.trim() : "";
-    if (!comment || /^(true|false)$/i.test(comment)) {
+    if (!comment || isJunkComment(comment)) {
       const det = await fetchReviewDetailSmart({
-        id: reviewId,
+        id: stableReviewKey || reviewId,
         chmBase: CHATMETER_V5_BASE,
         token: CHATMETER_V5_TOKEN,
         accountId: CHM_ACCOUNT_ID,
       });
       if (det) {
-        comment = getProviderComment(provider, det) || comment;
+        const extracted = getProviderComment(provider, det);
+        if (isNonEmptyString(extracted) && !isJunkComment(extracted)) {
+          comment = extracted.trim();
+        }
         // Backfill contact if missing
         if (!contactIn.email && isNonEmptyString(det.reviewerEmail)) {
           inBody.authorEmail = det.reviewerEmail;
@@ -98,6 +128,11 @@ export default async function handler(req, res) {
           inBody.authorPhone = det.reviewerPhone;
         }
       }
+    }
+
+    // Final fallback
+    if (!isNonEmptyString(comment) || isJunkComment(comment)) {
+      comment = ""; // will render "(no text)" in the note
     }
 
     const contact = {
@@ -117,8 +152,8 @@ export default async function handler(req, res) {
       body: JSON.stringify(payload),
     });
 
-    // ---- De-dupe by external_id ----
-    const external_id = `chatmeter:${reviewId}`;
+    // ---- De-dupe by stable external_id (prevents duplicate tickets) ----
+    const external_id = `chatmeter:${stableReviewKey || reviewId}`;
     const q = encodeURIComponent(`type:ticket external_id:"${external_id}"`);
     const dupRes = await zGet(`/search.json?query=${q}`);
     if (!dupRes.ok) {
@@ -130,7 +165,7 @@ export default async function handler(req, res) {
 
     // ---- Custom fields ----
     const custom_fields = [
-      { id: +ZD_FIELD_REVIEW_ID,   value: String(reviewId || "") },
+      { id: +ZD_FIELD_REVIEW_ID,   value: String(reviewId || stableReviewKey || "") },
       { id: +ZD_FIELD_LOCATION_ID, value: String(locationId || "") },
       { id: +ZD_FIELD_RATING,      value: rating || 0 },
     ];
@@ -153,7 +188,7 @@ export default async function handler(req, res) {
     });
 
     const requesterEmail = "reviews@drivo.com";
-    const tags = ["chatmeter", (provider || "chatmeter").toLowerCase(), `cmrvw_${reviewId}`];
+    const tags = ["chatmeter", (provider || "chatmeter").toLowerCase(), `cmrvw_${stableReviewKey || reviewId}`];
 
     if (!ticketId) {
       // Create new ticket
