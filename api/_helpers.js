@@ -1,6 +1,12 @@
 // /api/_helpers.js
+//
+// Shared helpers + provider-specific extractors.
+// Goal: always return a clean text comment, consistent location name/id,
+// and a tidy internal note for Zendesk.
 
-/** ---------- tiny utils ---------- */
+export const VERSION_HELPERS = "helpers-2025-10-10";
+
+/* ---------------- basics ---------------- */
 export function isNonEmptyString(x) {
   return typeof x === "string" && x.trim().length > 0;
 }
@@ -9,139 +15,171 @@ export function isBooleanString(x) {
   const t = x.trim().toLowerCase();
   return t === "true" || t === "false";
 }
-function looksLikeRating(x) {
-  if (!isNonEmptyString(x)) return false;
-  const t = x.trim();
-  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;      // "5" or "4.5"
-  if (/^★{1,5}$/.test(t)) return true;                 // "★★★★★"
-  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;         // "4/5"
-  if (/^nps[:\s]/i.test(t)) return true;               // "NPS: 9"
-  return false;
-}
-function isNoise(x) {
-  if (!isNonEmptyString(x)) return true;
-  const s = x.trim();
-  if (isBooleanString(s)) return true;                 // true/false
-  if (looksLikeRating(s)) return true;                 // ratings
-  if (/^https?:\/\//i.test(s)) return true;            // plain URL
-  if (/^[A-Za-z0-9+/_=-]{40,}$/.test(s)) return true;  // long token-ish strings
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return true;      // ISO date
-  return false;
+export function safeJSON(s, fb = {}) {
+  try { return JSON.parse(s); } catch { return fb; }
 }
 export function stars(n) {
-  const x = Math.max(0, Math.min(5, Number(n) || 0));
-  return "★".repeat(x) + "☆".repeat(5 - x);
+  const v = Math.max(0, Math.min(5, Number(n) || 0));
+  return "★".repeat(v) + "☆".repeat(5 - v);
 }
-
-/** ---------- provider normalization ---------- */
 export function normalizeProvider(p) {
-  const v = (p || "").toString().trim().toUpperCase();
+  const v = String(p || "").trim().toUpperCase();
   const MAP = {
-    "GOOGLE MAPS": "GOOGLE",
-    "GMAPS": "GOOGLE",
-    "META": "FACEBOOK",
-    "FB": "FACEBOOK",
+    "GOOGLE MAPS": "GOOGLE", "GMAPS": "GOOGLE",
     "TRUST PILOT": "TRUSTPILOT",
+    "META": "FACEBOOK", "FB": "FACEBOOK",
+    "MICROSOFT": "BING", "BING MAPS": "BING",
   };
   return MAP[v] || v;
 }
 
-/** ---------- ReviewBuilder free-text extraction ---------- */
-export function extractRBText(review) {
-  const rows = Array.isArray(review?.reviewData) ? review.reviewData : [];
-  const out = [];
-
-  for (const r of rows) {
-    const v = r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
-    if (!isNonEmptyString(v)) continue;
-    if (isBooleanString(v)) continue;
-    if (looksLikeRating(v)) continue;
-
-    out.push({
-      text: v.trim(),
-      boost: isNonEmptyString(r?.name) && /open|comment|verbatim|free|own\s*words|describe/i.test(r.name) ? 1 : 0,
-      len: v.trim().length,
-    });
-  }
-  if (!out.length) return "";
-
-  out.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
-
-  const seen = new Set();
-  const chosen = [];
-  for (const c of out) {
-    const k = c.text.toLowerCase();
-    if (seen.has(k)) continue;
-    chosen.push(c.text);
-    seen.add(k);
-    if (chosen.length >= 3) break;
-  }
-  return chosen.join("\n\n");
+/* ---------------- text heuristics ---------------- */
+function looksLikeRating(x) {
+  if (!isNonEmptyString(x)) return false;
+  const t = x.trim();
+  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;   // 5, 4.0
+  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;      // 4/5
+  if (/^★{1,5}$/.test(t)) return true;              // ★★★★☆
+  if (/^nps[:\s]/i.test(t)) return true;            // NPS: 9
+  return false;
 }
 
-/** ---------- Generic text extraction (detail/list payloads) ---------- */
-export function extractAnyText(obj) {
-  if (!obj || typeof obj !== "object") return "";
+/* ---------------- ReviewBuilder free-text extraction ---------------- */
+export function extractRBText(detail) {
+  // Chatmeter RB detail often has reviewData/answers (name/question + value/answerText)
+  const rows = Array.isArray(detail?.reviewData) ? detail.reviewData
+              : Array.isArray(detail?.answers)   ? detail.answers : [];
+  if (!rows.length) return "";
 
-  // 1) ReviewBuilder special case
-  const provider = normalizeProvider(obj.contentProvider || obj.provider || "");
-  if (provider === "REVIEWBUILDER") {
-    const rb = extractRBText(obj);
-    if (isNonEmptyString(rb)) return rb;
+  const candidates = [];
+  for (const r of rows) {
+    const label = (r?.name || r?.question || "").toString();
+    const raw   = r?.value ?? r?.answer ?? r?.answerText ?? r?.text ?? null;
+    if (!isNonEmptyString(raw)) continue;
+
+    // ignore obvious boolean/rating-ish rows
+    const val = String(raw).trim();
+    if (isBooleanString(val)) continue;
+    if (looksLikeRating(val)) continue;
+
+    const boost = /open|words|comment|describe|feedback/i.test(label) ? 1 : 0;
+    candidates.push({ val, boost, len: val.length, key: val.toLowerCase() });
   }
+  if (!candidates.length) return "";
 
-  // 2) Common fields (Chatmeter detail often has one of these)
-  const candidates = [
-    obj.comment,
-    obj.reviewText,
-    obj.text,
-    obj.body,
-    obj.content,
-    obj.reviewerComment,
-    obj.snippet,
-    obj.description
-  ]
-    .map(v => (typeof v === "string" ? v.trim() : ""))
-    .filter(v => isNonEmptyString(v) && !isNoise(v));
-
-  if (candidates.length) {
-    candidates.sort((a, b) => b.length - a.length);
-    return candidates[0];
+  // prefer boosted, then longest, unique
+  candidates.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
+  const out = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    if (seen.has(c.key)) continue;
+    out.push(c.val);
+    seen.add(c.key);
+    if (out.length >= 3) break;
   }
+  return out.join("\n\n");
+}
 
-  // 3) Scan nested structures to find best long, non-noise string
+/* ---------------- generic text fallback (scan any object) ---------------- */
+function deepScanForText(obj) {
   let best = "";
   (function scan(o) {
     if (typeof o === "string") {
       const s = o.trim();
-      if (!isNoise(s) && s.length > best.length) best = s;
+      if (!s) return;
+      // ignore URLs and timestamps
+      if (/^https?:\/\//i.test(s)) return;
+      if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return;
+      if (isBooleanString(s)) return;
+      if (looksLikeRating(s)) return;
+      if (s.length > best.length) best = s;
       return;
     }
-    if (Array.isArray(o)) o.forEach(scan);
-    else if (o && typeof o === "object") Object.values(o).forEach(scan);
+    if (Array.isArray(o)) { for (const x of o) scan(x); return; }
+    if (o && typeof o === "object") { for (const x of Object.values(o)) scan(x); }
   })(obj);
-
   return best;
 }
 
-/** ---------- Provider-agnostic comment getter from *list* item ---------- */
-export function getProviderComment(provider, review) {
-  const p = normalizeProvider(provider || review?.contentProvider || review?.provider || "");
-  // direct text if good
-  const direct = review?.comment ?? review?.reviewText ?? review?.text ?? review?.body ?? null;
-  if (isNonEmptyString(direct) && !isNoise(direct)) return direct.trim();
+/* ---------------- provider adapters ---------------- */
+function extractReviewBuilder(detail, envMap) {
+  const comment =
+    extractRBText(detail) ||
+    detail?.comment || detail?.reviewText || detail?.text || "";
 
-  if (p === "REVIEWBUILDER") {
-    const rb = extractRBText(review);
-    if (isNonEmptyString(rb)) return rb;
-  }
-  return "";
+  return {
+    provider: "REVIEWBUILDER",
+    authorName: detail?.reviewerUserName || detail?.customerName || "Anonymous",
+    comment: isNonEmptyString(comment) ? comment.trim() : "(no text)",
+    rating: Number(detail?.rating || 0),
+    locationId: String(detail?.locationId || ""),
+    locationName: envMap[String(detail?.locationId)] || detail?.locationName || "Unknown",
+    publicUrl: detail?.reviewURL || detail?.publicUrl || detail?.portalUrl || "",
+    createdAt: detail?.reviewDate || detail?.createdAt || new Date().toISOString(),
+  };
 }
 
-/** ---------- Internal note builder ---------- */
+function extractYelp(detail, envMap) {
+  const comment = detail?.comment || detail?.text || detail?.reviewText || deepScanForText(detail);
+  return {
+    provider: "YELP",
+    authorName: detail?.reviewerUserName || detail?.customerName || detail?.author || "Anonymous",
+    comment: isNonEmptyString(comment) ? comment.trim() : "(no text)",
+    rating: Number(detail?.rating || 0),
+    locationId: String(detail?.locationId || ""),
+    locationName: envMap[String(detail?.locationId)] || detail?.locationName || "Unknown",
+    publicUrl: detail?.reviewURL || detail?.publicUrl || detail?.portalUrl || "",
+    createdAt: detail?.reviewDate || detail?.createdAt || new Date().toISOString(),
+  };
+}
+
+function extractGoogle(detail, envMap) {
+  const comment = detail?.text || detail?.comment || detail?.reviewText || deepScanForText(detail);
+  return {
+    provider: "GOOGLE",
+    authorName: detail?.reviewerUserName || detail?.customerName || detail?.author || "Anonymous",
+    comment: isNonEmptyString(comment) ? comment.trim() : "(no text)",
+    rating: Number(detail?.rating || 0),
+    locationId: String(detail?.locationId || ""),
+    locationName: envMap[String(detail?.locationId)] || detail?.locationName || "Unknown",
+    publicUrl: detail?.reviewURL || detail?.publicUrl || detail?.portalUrl || "",
+    createdAt: detail?.reviewDate || detail?.createdAt || new Date().toISOString(),
+  };
+}
+
+function extractGeneric(detail, envMap) {
+  const comment = detail?.comment || detail?.text || detail?.reviewText || deepScanForText(detail);
+  return {
+    provider: normalizeProvider(detail?.provider || detail?.contentProvider || ""),
+    authorName: detail?.reviewerUserName || detail?.customerName || detail?.author || "Anonymous",
+    comment: isNonEmptyString(comment) ? comment.trim() : "(no text)",
+    rating: Number(detail?.rating || 0),
+    locationId: String(detail?.locationId || ""),
+    locationName: envMap[String(detail?.locationId)] || detail?.locationName || "Unknown",
+    publicUrl: detail?.reviewURL || detail?.publicUrl || detail?.portalUrl || "",
+    createdAt: detail?.reviewDate || detail?.createdAt || new Date().toISOString(),
+  };
+}
+
+/**
+ * Normalize a review into our internal shape using provider-specific rules.
+ * @param {string} provider
+ * @param {object} listItem   (optional) original list item
+ * @param {object} detail     provider detail payload (preferred)
+ * @param {object} envMap     locationId->name map from env
+ */
+export function extractReviewData(provider, listItem, detail, envMap = {}) {
+  const p = normalizeProvider(provider || detail?.provider || detail?.contentProvider || "");
+  if (p === "REVIEWBUILDER") return extractReviewBuilder(detail || listItem || {}, envMap);
+  if (p === "YELP")          return extractYelp(detail || listItem || {}, envMap);
+  if (p === "GOOGLE")        return extractGoogle(detail || listItem || {}, envMap);
+  return extractGeneric(detail || listItem || {}, envMap);
+}
+
+/* ---------------- internal note ---------------- */
 export function buildInternalNote({ dt, customer, provider, locationName, locationId, rating, comment, viewUrl }) {
   return [
-    "Review Information",
+    "**Review Information**",
     "",
     `Date: ${dt || "-"}`,
     `Customer: ${customer || "-"}`,
@@ -149,11 +187,10 @@ export function buildInternalNote({ dt, customer, provider, locationName, locati
     `Location: ${locationName ? `${locationName} (${locationId || "-"})` : (locationId || "-")}`,
     `Rating: ${stars(rating)}`,
     "Comment:",
-    isNonEmptyString(comment) ? comment : "(no text)",
+    (isNonEmptyString(comment) ? comment : "(no text)"),
     "",
-    isNonEmptyString(viewUrl) ? "View in Chatmeter" : "",
-    isNonEmptyString(viewUrl) ? `[View in Chatmeter](${viewUrl})` : "",
+    isNonEmptyString(viewUrl) ? `[View in Chatmeter](${viewUrl})` : "View in Chatmeter",
     "",
     "_The first public comment on this ticket will be posted to Chatmeter._",
-  ].filter(Boolean).join("\n");
+  ].join("\n");
 }
