@@ -1,54 +1,49 @@
-// /api/_helpers.js
-// Unified helper for Chatmeter → Zendesk bridge (final)
+// /api/_helpers.js — final helper set for Chatmeter ⇄ Zendesk bridge
 
+/* -------------------- small predicates -------------------- */
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
-
 export function isBooleanString(v) {
   if (!isNonEmptyString(v)) return false;
   const t = v.trim().toLowerCase();
   return t === "true" || t === "false";
 }
-
 function looksLikeRating(x) {
   if (!isNonEmptyString(x)) return false;
   const t = x.trim();
   return (
-    /^[0-9]+(\.[0-9]+)?$/.test(t) || // 5, 4.0
-    /^★{1,5}$/.test(t) ||            // ★★★★☆
-    /^[0-9]+\/[0-9]+$/.test(t) ||    // 4/5
-    /^nps[:\s]/i.test(t)             // NPS: 9
+    /^[0-9]+(\.[0-9]+)?$/.test(t) ||   // 5, 4.0
+    /^★{1,5}$/.test(t) ||              // ★★★★☆
+    /^[0-9]+\/[0-9]+$/.test(t) ||      // 4/5
+    /^nps[:\s]/i.test(t)               // NPS: 9
   );
 }
-
-/** Treat obvious junk as non-comment (hashes, urls, ids…) */
 function isJunkText(s) {
   if (!isNonEmptyString(s)) return true;
   const t = s.trim();
-
-  if (isBooleanString(t)) return true;
-  if (/^https?:\/\//i.test(t)) return true;
-  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;
-  if (looksLikeRating(t)) return true;
-
-  // 24-hex (mongo-like)
-  if (/^[A-Fa-f0-9]{24}$/.test(t)) return true;
-  // UUID
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true;
-  // Base64-ish long token with no vowels (e.g., Yelp/Google ids)
-  if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t)) return true;
-
+  if (isBooleanString(t)) return true;                 // true/false
+  if (/^https?:\/\//i.test(t)) return true;            // URL
+  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;      // ISO date
+  if (looksLikeRating(t)) return true;                 // ratings
+  if (/^[A-Fa-f0-9]{24}$/.test(t)) return true;        // 24-hex id
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // uuid
+  if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t)) return true;            // token-ish
   return false;
 }
 
-/** ---------- Provider & contact ---------- */
+/* -------------------- provider & contact -------------------- */
 export function normalizeProvider(p) {
   const v = (p || "").toString().trim().toUpperCase();
-  const MAP = { "GOOGLE MAPS": "GOOGLE", GMAPS: "GOOGLE", META: "FACEBOOK", FB: "FACEBOOK", "TRUST PILOT": "TRUSTPILOT" };
+  const MAP = {
+    "GOOGLE MAPS": "GOOGLE",
+    GMAPS: "GOOGLE",
+    META: "FACEBOOK",
+    FB: "FACEBOOK",
+    "TRUST PILOT": "TRUSTPILOT",
+  };
   return MAP[v] || v;
 }
-
 export function pickCustomerContact(o = {}) {
   const email = o.reviewerEmail || o.authorEmail || o.email || o.customerEmail || "";
   const phone = o.reviewerPhone || o.authorPhone || o.phone || o.customerPhone || "";
@@ -58,49 +53,64 @@ export function pickCustomerContact(o = {}) {
   };
 }
 
-/** ---------- Comment extraction helpers ---------- */
+/* -------------------- comment extraction -------------------- */
 export function extractRBText(review) {
   const rows = Array.isArray(review?.reviewData) ? review.reviewData : [];
-  const out = [];
+  if (!rows.length) return "";
 
+  const candidates = [];
   for (const r of rows) {
-    const v = r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
-    if (!isNonEmptyString(v)) continue;
-    const val = String(v).trim();
+    const name = String(r?.name || "").toLowerCase();
+    const raw  = r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? "";
+    if (!isNonEmptyString(String(raw))) continue;
+    const val = String(raw).trim();
     if (isBooleanString(val) || looksLikeRating(val) || isJunkText(val)) continue;
 
-    const name = String(r?.name || "").toLowerCase();
-    const boost = /open|own\s*words|comment|verbatim|describe|feedback|text/.test(name) ? 1 : 0;
-    out.push({ text: val, boost, len: val.length });
+    const boost =
+      /open|own\s*words|comment|verbatim|describe|feedback|text|in\s+your\s+own\s+words/.test(name) ? 2 : 0;
+    // small length boost so longer, more informative answers win
+    const lenBoost = Math.min(2, Math.floor(val.length / 120));
+    candidates.push({ text: val, score: boost + lenBoost });
   }
 
-  if (!out.length) return "";
-  out.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
+  if (!candidates.length) return "";
+  candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length);
 
-  const seen = new Set(); const chosen = [];
-  for (const c of out) {
+  const out = [];
+  const seen = new Set();
+  for (const c of candidates) {
     const k = c.text.toLowerCase();
     if (seen.has(k)) continue;
-    chosen.push(c.text);
+    out.push(c.text);
     seen.add(k);
-    if (chosen.length >= 3) break;
+    if (out.length >= 3) break;
   }
-  return chosen.join("\n\n");
+  return out.join("\n\n");
 }
 
 function extractYelpGoogleComment(review) {
-  return (
-    (isNonEmptyString(review.text) ? review.text.trim() : "") ||
-    (isNonEmptyString(review.reviewBody) ? review.reviewBody.trim() : "") ||
-    (isNonEmptyString(review.body) ? review.body.trim() : "") ||
-    (isNonEmptyString(review.snippet) ? review.snippet.trim() : "") ||
-    (isNonEmptyString(review.comment) ? review.comment.trim() : "")
-  );
+  const fields = [
+    review?.text,
+    review?.reviewText,
+    review?.review_body,
+    review?.reviewBody,
+    review?.body,
+    review?.snippet,
+    review?.content,
+    review?.reviewerComment,
+    review?.comment,
+  ];
+  for (const f of fields) {
+    if (isNonEmptyString(f) && !isJunkText(f)) return String(f).trim();
+  }
+  return "";
 }
 
-/** ---------- FINAL: provider-agnostic comment getter (improved) ---------- */
+/**
+ * Provider-agnostic comment getter.
+ * Accepts (provider, review) OR (review) — both signatures supported.
+ */
 export function getProviderComment(reviewProviderOrObj, maybeReview) {
-  // Allow both signatures: (provider, review) or (review)
   const review = maybeReview ?? reviewProviderOrObj;
   const providerInput = maybeReview ? reviewProviderOrObj : (review?.contentProvider || review?.provider);
   const provider = normalizeProvider(providerInput);
@@ -108,7 +118,7 @@ export function getProviderComment(reviewProviderOrObj, maybeReview) {
   let text = "";
 
   if (provider === "REVIEWBUILDER" || provider === "SURVEYS") {
-    // If comment is present and not boolean/junk, use it; otherwise RB free-text
+    // If direct comment is a real string, use it; otherwise pull from reviewData
     if (isNonEmptyString(review?.comment) && !isJunkText(review.comment)) {
       text = review.comment.trim();
     } else {
@@ -117,7 +127,6 @@ export function getProviderComment(reviewProviderOrObj, maybeReview) {
   } else if (provider === "GOOGLE" || provider === "YELP") {
     text = extractYelpGoogleComment(review);
   } else {
-    // Other providers
     const direct = [
       review?.text,
       review?.comment,
@@ -138,7 +147,7 @@ export function getProviderComment(reviewProviderOrObj, maybeReview) {
   return text;
 }
 
-/** ---------- Formatting ---------- */
+/* -------------------- formatting -------------------- */
 export function stars(n) {
   const x = Math.max(0, Math.min(5, Number(n) || 0));
   return "★".repeat(x) + "☆".repeat(5 - x);
@@ -173,7 +182,7 @@ export function buildInternalNote({
 
   lines.push("", "_The first public comment on this ticket will be posted to Chatmeter._");
 
-  // optional contact lines just after Customer
+  // optional contact lines, directly under Customer
   const contact = [];
   if (isNonEmptyString(customerEmail)) contact.push(customerEmail.trim());
   if (isNonEmptyString(customerPhone)) contact.push(customerPhone.trim());
