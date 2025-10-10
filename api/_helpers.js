@@ -1,12 +1,8 @@
 // /api/_helpers.js
-// Shared helpers for Chatmeter → Zendesk bridge
+// Updated helpers for Chatmeter → Zendesk bridge
 
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
-}
-
-export function isBooleanString(v) {
-  return typeof v === "string" && /^(true|false)$/i.test(v.trim());
 }
 
 export function normalizeProvider(p) {
@@ -35,7 +31,9 @@ export function pickCustomerContact(inBody) {
   return { email, phone };
 }
 
-/* -------------------- FIXED COMMENT EXTRACTOR -------------------- */
+/* ------------------------------------------------------------------ */
+/* FIXED COMMENT DETECTION (covers ReviewBuilder Q&A + nested answers) */
+/* ------------------------------------------------------------------ */
 export function getProviderComment(provider, data = {}) {
   if (!data || typeof data !== "object") return "";
 
@@ -56,23 +54,34 @@ export function getProviderComment(provider, data = {}) {
     let val = data;
     for (const p of parts) val = val && typeof val === "object" ? val[p] : undefined;
     if (isNonEmptyString(val)) {
-      const cleaned = String(val).trim();
-      if (
-        cleaned &&
-        !/^(true|false|null|undefined)$/i.test(cleaned) &&
-        !/^[A-Za-z0-9+/_=-]{20,}$/.test(cleaned)
-      ) {
+      const cleaned = val.trim();
+      if (!/^(true|false|null|undefined)$/i.test(cleaned)) {
         return cleaned;
       }
     }
   }
 
-  // Some ReviewBuilder reviews store text in "answers"
+  // 🆕 Handle ReviewBuilder structured answers
+  if (Array.isArray(data.reviewData)) {
+    const textAnswer = data.reviewData.find(
+      (a) =>
+        a &&
+        a.name &&
+        /own words|experience|feedback|comment/i.test(a.name) &&
+        isNonEmptyString(a.value)
+    );
+    if (textAnswer) return textAnswer.value.trim();
+  }
+
   if (Array.isArray(data.answers)) {
-    const answer = data.answers.find(a => a && a.question && /experience|feedback/i.test(a.question));
-    if (answer && isNonEmptyString(answer.answer)) {
-      return answer.answer.trim();
-    }
+    const textAnswer = data.answers.find(
+      (a) =>
+        a &&
+        a.question &&
+        /own words|experience|feedback|comment/i.test(a.question) &&
+        isNonEmptyString(a.answer)
+    );
+    if (textAnswer) return textAnswer.answer.trim();
   }
 
   return "";
