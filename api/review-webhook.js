@@ -2,12 +2,11 @@
 // Chatmeter -> Zendesk: create/update ticket with ONE INTERNAL card.
 //
 // Key points:
-// - Uses two IDs
-//   * dedupeId : providerReviewId || id || reviewId   → Zendesk external_id (stable)
-//   * lookupId : id || reviewId || providerReviewId   → Chatmeter /reviews/{id} (works for RB)
-// - For REVIEWBUILDER we ALWAYS fetch detail and extract the real free-text.
-// - For other providers we fetch detail only if incoming text is empty/junk.
-// - Internal note is formatted exactly like your desired structure.
+// - Two-ID strategy:
+//    * dedupeId  = providerReviewId || id || reviewId      -> Zendesk external_id
+//    * lookupId  = id || reviewId || providerReviewId      -> Chatmeter /reviews/{id}
+// - REVIEWBUILDER: ALWAYS fetch detail and extract free-text from reviewData.
+// - GOOGLE/YELP/others: fetch detail only if incoming text is empty/junk.
 
 import {
   getProviderComment,
@@ -18,46 +17,47 @@ import {
   pickCustomerContact,
 } from "./_helpers.js";
 
-/** Try multiple paths/ids to retrieve review detail (handles ReviewBuilder path). */
-async function fetchReviewDetailSmart({ id, chmBase, token, accountId }) {
-  if (!id || !token) return null;
-  const headers = { Authorization: token };
-  const idStr = String(id);
-
-  const paths = [
-    `/reviews/${encodeURIComponent(idStr)}`,
-    `/reviewBuilder/reviews/${encodeURIComponent(idStr)}`,
-  ];
-
-  for (const p of paths) {
-    const url =
-      `${chmBase}${p}` + (accountId ? `?accountId=${encodeURIComponent(accountId)}` : "");
-    try {
-      const r = await fetch(url, { headers });
-      const t = await r.text();
-      if (!r.ok) continue;
-      try { return JSON.parse(t); } catch { return {}; }
-    } catch { /* try next */ }
-  }
-  return null;
-}
-
-/** Heuristic to reject junk strings (ids, tokens, urls, ratings, booleans). */
+/* ---------- tiny local guard for junk strings (ids/urls/booleans/ratings/tokens) ---------- */
 function isJunkComment(s) {
   if (!isNonEmptyString(s)) return true;
   const t = s.trim();
 
   if (isBooleanString(t)) return true;
-  if (/^https?:\/\//i.test(t)) return true;
-  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;
-  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;            // 5 / 4.0
-  if (/^★{1,5}$/.test(t)) return true;                       // ★★★★☆
-  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;               // 4/5
-  if (/^[A-Fa-f0-9]{24}$/.test(t)) return true;              // 24-hex
+  if (/^https?:\/\//i.test(t)) return true;                       // URL
+  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return true;                  // ISO date
+  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;                  // 5, 4.0
+  if (/^★{1,5}$/.test(t)) return true;                             // ★★★★☆
+  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;                     // 4/5
+  if (/^[A-Fa-f0-9]{24}$/.test(t)) return true;                    // 24-hex
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t)) return true; // uuid
   if (/^[A-Za-z0-9+/_=-]{20,}$/.test(t) && !/\s/.test(t) && !/[aeiou]/i.test(t)) return true; // token-ish
 
   return false;
+}
+
+/* ---------- Fetch Chatmeter review detail trying multiple id/path variants ---------- */
+async function fetchReviewDetailSmart({ idCandidates, chmBase, token, accountId }) {
+  const ids = (Array.isArray(idCandidates) ? idCandidates : [idCandidates]).filter(Boolean);
+  if (!ids.length || !token) return null;
+  const headers = { Authorization: token };
+
+  for (const idRaw of ids) {
+    const id = String(idRaw);
+    const paths = [
+      `/reviews/${encodeURIComponent(id)}`,
+      `/reviewBuilder/reviews/${encodeURIComponent(id)}`,
+    ];
+    for (const p of paths) {
+      const url = `${chmBase}${p}` + (accountId ? `?accountId=${encodeURIComponent(accountId)}` : "");
+      try {
+        const r = await fetch(url, { headers });
+        const t = await r.text();
+        if (!r.ok) continue;
+        try { return JSON.parse(t); } catch { return {}; }
+      } catch { /* try next */ }
+    }
+  }
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -70,7 +70,7 @@ export default async function handler(req, res) {
     ZD_FIELD_REVIEW_ID,
     ZD_FIELD_LOCATION_ID,
     ZD_FIELD_RATING,
-    ZD_FIELD_FIRST_REPLY_SENT, // not used here
+    ZD_FIELD_FIRST_REPLY_SENT, // not used here; kept for compatibility
     ZD_FIELD_LOCATION_NAME,    // optional
     CHATMETER_V5_BASE = "https://live.chatmeter.com/v5",
     CHATMETER_V5_TOKEN,
@@ -95,9 +95,16 @@ export default async function handler(req, res) {
     const rawProviderReviewId = inBody.providerReviewId || inBody.provider_review_id;
     const rawId               = inBody.id || inBody.reviewId;
 
-    const dedupeId = String(rawProviderReviewId || rawId || ""); // Zendesk
+    const dedupeId = String(rawProviderReviewId || rawId || ""); // Zendesk external_id
     const lookupId = String(rawId || rawProviderReviewId || ""); // Chatmeter detail
-    const reviewId = rawId || rawProviderReviewId || "";         // display / field
+    const reviewId = rawId || rawProviderReviewId || "";         // for field display
+
+    // Build a candidate list for detail fetch
+    const idCandidates = [
+      lookupId || null,
+      reviewId || null,
+      rawProviderReviewId || null,
+    ].filter(Boolean);
 
     // ---------- Normalize core fields
     const provider     = normalizeProvider(inBody.provider || inBody.contentProvider || "");
@@ -109,32 +116,27 @@ export default async function handler(req, res) {
     const publicUrl    = inBody.publicUrl || inBody.reviewURL || inBody.portalUrl || "";
     const contactIn    = pickCustomerContact(inBody); // { email, phone }
 
-    // ---------- Comment (force RB detail; fallback otherwise)
+    // ---------- Comment (ALWAYS fetch for REVIEWBUILDER; conditional for others)
     let comment = isNonEmptyString(inBody.text) ? inBody.text.trim() : "";
     let det = null;
 
-    // Always fetch detail for ReviewBuilder (comment can be boolean/empty in events)
     if (provider === "REVIEWBUILDER") {
       det = await fetchReviewDetailSmart({
-        id: lookupId || reviewId,
+        idCandidates,
         chmBase: CHATMETER_V5_BASE,
         token: CHATMETER_V5_TOKEN,
         accountId: CHM_ACCOUNT_ID,
       });
-
       if (det) {
         const extracted = getProviderComment(provider, det);
-        if (isNonEmptyString(extracted) && !isJunkComment(extracted)) {
-          comment = extracted.trim();
-        }
+        if (isNonEmptyString(extracted) && !isJunkComment(extracted)) comment = extracted.trim();
       }
     }
 
-    // For non-RB (or if RB extraction still empty), try detail once
     if (!isNonEmptyString(comment) || isJunkComment(comment)) {
       if (!det) {
         det = await fetchReviewDetailSmart({
-          id: lookupId || reviewId,
+          idCandidates,
           chmBase: CHATMETER_V5_BASE,
           token: CHATMETER_V5_TOKEN,
           accountId: CHM_ACCOUNT_ID,
@@ -142,18 +144,13 @@ export default async function handler(req, res) {
       }
       if (det) {
         const extracted = getProviderComment(provider, det);
-        if (isNonEmptyString(extracted) && !isJunkComment(extracted)) {
-          comment = extracted.trim();
-        }
-        // Backfill contact if available
+        if (isNonEmptyString(extracted) && !isJunkComment(extracted)) comment = extracted.trim();
         if (!contactIn.email && isNonEmptyString(det.reviewerEmail)) inBody.authorEmail = det.reviewerEmail;
         if (!contactIn.phone && isNonEmptyString(det.reviewerPhone)) inBody.authorPhone = det.reviewerPhone;
       }
     }
 
-    if (!isNonEmptyString(comment) || isJunkComment(comment)) {
-      comment = ""; // note will render "(no text)"
-    }
+    if (!isNonEmptyString(comment) || isJunkComment(comment)) comment = ""; // note renders "(no text)"
 
     const contact = {
       email: inBody.authorEmail || contactIn.email || "",
@@ -193,7 +190,7 @@ export default async function handler(req, res) {
       custom_fields.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName || "" });
     }
 
-    // ---------- Build internal note
+    // ---------- Internal note
     const note = buildInternalNote({
       dt: createdAt,
       customerName: authorName,
@@ -228,7 +225,7 @@ export default async function handler(req, res) {
       const j = JSON.parse(t);
       return res.status(200).json({ ok: true, action: "created", id: j?.ticket?.id, externalId: external_id });
     } else {
-      // Update existing ticket (no extra internal note to avoid duplicates)
+      // Update existing ticket (avoid duplicate internal note)
       const payload = { ticket: { external_id, tags, custom_fields } };
       const r = await zSend(`/tickets/${ticketId}.json`, "PUT", payload);
       const t = await r.text();
