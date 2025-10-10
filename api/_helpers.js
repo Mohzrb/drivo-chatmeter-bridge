@@ -1,5 +1,5 @@
 // /api/_helpers.js
-// FINAL version with deep ReviewBuilder comment extraction
+// FINAL-FINAL version — with recursive text scan for Chatmeter reviews
 
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
@@ -32,11 +32,37 @@ export function pickCustomerContact(inBody) {
 }
 
 /* ------------------------------------------------------------------ */
-/* DEEP COMMENT DETECTION (for ReviewBuilder Q&A structure)            */
+/* DEEP + RECURSIVE COMMENT DETECTION                                 */
 /* ------------------------------------------------------------------ */
+function deepScanForText(obj) {
+  if (!obj || typeof obj !== "object") return null;
+
+  for (const [k, v] of Object.entries(obj)) {
+    if (isNonEmptyString(v)) {
+      if (
+        /own words|experience|feedback|describe/i.test(k) ||
+        /experience|negative|positive|terrible|good|bad|service|rental|car|insurance/i.test(v)
+      ) {
+        return v.trim();
+      }
+    } else if (Array.isArray(v)) {
+      for (const item of v) {
+        const found = deepScanForText(item);
+        if (found) return found;
+      }
+    } else if (typeof v === "object") {
+      const found = deepScanForText(v);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
 export function getProviderComment(provider, data = {}) {
   if (!data || typeof data !== "object") return "";
 
+  // Standard paths first
   const paths = [
     "comment",
     "review.comment",
@@ -61,7 +87,7 @@ export function getProviderComment(provider, data = {}) {
     }
   }
 
-  // ✅ Handle ReviewBuilder structured `reviewData` array
+  // Handle structured reviewData array
   if (Array.isArray(data.reviewData)) {
     const answer = data.reviewData.find(
       (a) =>
@@ -73,7 +99,7 @@ export function getProviderComment(provider, data = {}) {
     if (answer) return answer.value.trim();
   }
 
-  // ✅ Handle legacy "answers" array
+  // Handle structured answers array
   if (Array.isArray(data.answers)) {
     const answer = data.answers.find(
       (a) =>
@@ -84,6 +110,10 @@ export function getProviderComment(provider, data = {}) {
     );
     if (answer) return answer.answer.trim();
   }
+
+  // 🔥 NEW: Deep recursive scan as final fallback
+  const recursive = deepScanForText(data);
+  if (recursive) return recursive;
 
   return "";
 }
