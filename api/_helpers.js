@@ -1,5 +1,5 @@
 // /api/_helpers.js
-// Updated helpers for Chatmeter → Zendesk bridge
+// FINAL version with deep ReviewBuilder comment extraction
 
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
@@ -32,7 +32,7 @@ export function pickCustomerContact(inBody) {
 }
 
 /* ------------------------------------------------------------------ */
-/* FIXED COMMENT DETECTION (covers ReviewBuilder Q&A + nested answers) */
+/* DEEP COMMENT DETECTION (for ReviewBuilder Q&A structure)            */
 /* ------------------------------------------------------------------ */
 export function getProviderComment(provider, data = {}) {
   if (!data || typeof data !== "object") return "";
@@ -61,27 +61,28 @@ export function getProviderComment(provider, data = {}) {
     }
   }
 
-  // 🆕 Handle ReviewBuilder structured answers
+  // ✅ Handle ReviewBuilder structured `reviewData` array
   if (Array.isArray(data.reviewData)) {
-    const textAnswer = data.reviewData.find(
+    const answer = data.reviewData.find(
       (a) =>
         a &&
         a.name &&
-        /own words|experience|feedback|comment/i.test(a.name) &&
+        /own words|experience|feedback|describe/i.test(a.name) &&
         isNonEmptyString(a.value)
     );
-    if (textAnswer) return textAnswer.value.trim();
+    if (answer) return answer.value.trim();
   }
 
+  // ✅ Handle legacy "answers" array
   if (Array.isArray(data.answers)) {
-    const textAnswer = data.answers.find(
+    const answer = data.answers.find(
       (a) =>
         a &&
         a.question &&
-        /own words|experience|feedback|comment/i.test(a.question) &&
+        /own words|experience|feedback|describe/i.test(a.question) &&
         isNonEmptyString(a.answer)
     );
-    if (textAnswer) return textAnswer.answer.trim();
+    if (answer) return answer.answer.trim();
   }
 
   return "";
