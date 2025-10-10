@@ -1,10 +1,9 @@
-// /api/_helpers.js
-// FINAL-FINAL version — with recursive text scan for Chatmeter reviews
+// /api/_helpers.js — FINAL with deep/recursive extraction & version
+export const HELPERS_VERSION = "helpers-2025-10-10-rb-deep";
 
 export function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
-
 export function normalizeProvider(p) {
   if (!p) return "";
   const t = p.toString().toUpperCase();
@@ -14,139 +13,102 @@ export function normalizeProvider(p) {
   if (t.includes("FACEBOOK")) return "FACEBOOK";
   return t;
 }
-
-export function pickCustomerContact(inBody) {
-  const email =
-    inBody.email ||
-    inBody.customerEmail ||
-    inBody.authorEmail ||
-    inBody.contactEmail ||
-    "";
-  const phone =
-    inBody.phone ||
-    inBody.customerPhone ||
-    inBody.authorPhone ||
-    inBody.contactPhone ||
-    "";
-  return { email, phone };
+export function pickCustomerContact(o = {}) {
+  const email = o.reviewerEmail || o.authorEmail || o.email || o.customerEmail || "";
+  const phone = o.reviewerPhone || o.authorPhone || o.phone || o.customerPhone || "";
+  return { email: isNonEmptyString(email) ? email.trim() : "", phone: isNonEmptyString(phone) ? phone.trim() : "" };
 }
 
-/* ------------------------------------------------------------------ */
-/* DEEP + RECURSIVE COMMENT DETECTION                                 */
-/* ------------------------------------------------------------------ */
+/* ---------- deep text scan ----------- */
 function deepScanForText(obj) {
   if (!obj || typeof obj !== "object") return null;
-
+  if (Array.isArray(obj)) {
+    for (const it of obj) {
+      const found = deepScanForText(it);
+      if (found) return found;
+    }
+    return null;
+  }
   for (const [k, v] of Object.entries(obj)) {
     if (isNonEmptyString(v)) {
-      if (
-        /own words|experience|feedback|describe/i.test(k) ||
-        /experience|negative|positive|terrible|good|bad|service|rental|car|insurance/i.test(v)
-      ) {
-        return v.trim();
+      const s = v.trim();
+      if (!/^(true|false|null|undefined)$/i.test(s) && !/^https?:\/\//i.test(s)) {
+        // prefer keys likely to be free-text
+        if (/own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/i.test(k)) return s;
       }
-    } else if (Array.isArray(v)) {
-      for (const item of v) {
-        const found = deepScanForText(item);
-        if (found) return found;
-      }
-    } else if (typeof v === "object") {
+    } else if (v && typeof v === "object") {
       const found = deepScanForText(v);
       if (found) return found;
     }
   }
-
   return null;
 }
 
+/* ---------- provider-agnostic comment ---------- */
 export function getProviderComment(provider, data = {}) {
   if (!data || typeof data !== "object") return "";
 
-  // Standard paths first
-  const paths = [
-    "comment",
-    "review.comment",
-    "review.text",
-    "text",
-    "body",
-    "reviewBody",
-    "reviewData.commentText",
-    "reviewData.freeText",
-    "reviewData.reviewBody",
+  // direct/common fields first
+  const directPaths = [
+    "text","comment","body","reviewText","reviewBody",
+    "review.text","review.comment",
+    "reviewData.commentText","reviewData.freeText","reviewData.reviewBody"
   ];
-
-  for (const path of paths) {
+  for (const path of directPaths) {
     const parts = path.split(".");
     let val = data;
     for (const p of parts) val = val && typeof val === "object" ? val[p] : undefined;
     if (isNonEmptyString(val)) {
-      const cleaned = val.trim();
-      if (!/^(true|false|null|undefined)$/i.test(cleaned)) {
-        return cleaned;
-      }
+      const s = String(val).trim();
+      if (!/^(true|false|null|undefined)$/i.test(s)) return s;
     }
   }
 
-  // Handle structured reviewData array
+  // ReviewBuilder: array of Q&A objects
   if (Array.isArray(data.reviewData)) {
-    const answer = data.reviewData.find(
-      (a) =>
-        a &&
-        a.name &&
-        /own words|experience|feedback|describe/i.test(a.name) &&
-        isNonEmptyString(a.value)
-    );
-    if (answer) return answer.value.trim();
+    const best = [];
+    for (const rd of data.reviewData) {
+      const name = String(rd?.name || "").toLowerCase();
+      const val  = String(rd?.value ?? rd?.answer ?? "").trim();
+      if (!isNonEmptyString(val)) continue;
+      if (/own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/.test(name)) best.push(val);
+    }
+    if (best.length) return best.join("\n\n");
   }
 
-  // Handle structured answers array
   if (Array.isArray(data.answers)) {
-    const answer = data.answers.find(
-      (a) =>
-        a &&
-        a.question &&
-        /own words|experience|feedback|describe/i.test(a.question) &&
-        isNonEmptyString(a.answer)
-    );
-    if (answer) return answer.answer.trim();
+    const best = [];
+    for (const a of data.answers) {
+      const q = String(a?.question || "").toLowerCase();
+      const val = String(a?.answer || "").trim();
+      if (!isNonEmptyString(val)) continue;
+      if (/own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/.test(q)) best.push(val);
+    }
+    if (best.length) return best.join("\n\n");
   }
 
-  // 🔥 NEW: Deep recursive scan as final fallback
-  const recursive = deepScanForText(data);
-  if (recursive) return recursive;
-
-  return "";
+  // final fallback: recursive scan
+  const found = deepScanForText(data);
+  return isNonEmptyString(found) ? found : "";
 }
 
-/* -------------------- INTERNAL NOTE BUILDER -------------------- */
-export function buildInternalNote({
-  dt,
-  customerName,
-  customerEmail,
-  customerPhone,
-  provider,
-  locationName,
-  locationId,
-  rating,
-  comment,
-  viewUrl,
-}) {
-  const ratingStars = "★".repeat(rating) + "☆".repeat(5 - rating);
-  const safeComment = comment && comment.trim() ? comment.trim() : "(no text)";
-
+/* ---------- stars & note ---------- */
+function stars(n) {
+  const x = Math.max(0, Math.min(5, Number(n) || 0));
+  return "★".repeat(x) + "☆".repeat(5 - x);
+}
+export function buildInternalNote({ dt, customerName, customerEmail, customerPhone, provider, locationName, locationId, rating, comment, viewUrl }) {
   const lines = [
-    `Review Information`,
-    `Date: ${dt}`,
-    `Customer: ${customerName || "N/A"}`,
-    `Provider: ${provider}`,
-    `Location: ${locationName} (${locationId})`,
-    `Rating: ${ratingStars}`,
+    "Review Information","",
+    `Date: ${dt || "-"}`,
+    `Customer: ${customerName || "-"}`,
+    `Provider: ${provider || "-"}`,
+    `Location: ${locationName ? `${locationName} (${locationId || "-"})` : (locationId || "-")}`,
+    `Rating: ${stars(rating)}`,
     `Comment:`,
-    safeComment,
-    "",
-    viewUrl ? `[View in Chatmeter](${viewUrl})` : "",
+    isNonEmptyString(comment) ? comment : "(no text)","",
+    isNonEmptyString(viewUrl) ? `[View in Chatmeter](${viewUrl})` : "","",
     "_The first public comment on this ticket will be posted to Chatmeter._",
-  ];
-
+  ].filter(Boolean);
   return lines.join("\n");
 }
