@@ -1,183 +1,158 @@
 // /api/_helpers.js
-// FINAL with deep/recursive extraction, origin in note, and version flag
 
-export const HELPERS_VERSION = "helpers-2025-10-10-rb-deep+origin";
-
-/* -------------------- small utils -------------------- */
-export function isNonEmptyString(v) {
-  return typeof v === "string" && v.trim().length > 0;
+/** -------------------- type helpers -------------------- **/
+export function isNonEmptyString(x) {
+  return typeof x === "string" && x.trim().length > 0;
+}
+export function isBooleanString(x) {
+  if (!isNonEmptyString(x)) return false;
+  const t = x.trim().toLowerCase();
+  return t === "true" || t === "false";
+}
+export function looksLikeRating(x) {
+  if (!isNonEmptyString(x)) return false;
+  const t = x.trim();
+  if (/^[0-9]+(\.[0-9]+)?$/.test(t)) return true;    // 4 or 4.5
+  if (/^★{1,5}$/.test(t)) return true;               // ★★★★☆
+  if (/^[0-9]+\/[0-9]+$/.test(t)) return true;       // 4/5
+  if (/^nps[:\s]/i.test(t)) return true;             // NPS: 9
+  return false;
 }
 
+/** -------------------- provider normalization -------------------- **/
 export function normalizeProvider(p) {
-  if (!p) return "";
-  const t = p.toString().toUpperCase();
-  if (t.includes("GOOGLE")) return "GOOGLE";
-  if (t.includes("YELP")) return "YELP";
-  if (t.includes("REVIEWBUILDER")) return "REVIEWBUILDER";
-  if (t.includes("FACEBOOK")) return "FACEBOOK";
-  if (t.includes("BING")) return "BING";
-  return t;
-}
-
-export function pickCustomerContact(o = {}) {
-  const email =
-    o.reviewerEmail || o.authorEmail || o.email || o.customerEmail || "";
-  const phone =
-    o.reviewerPhone || o.authorPhone || o.phone || o.customerPhone || "";
-  return {
-    email: isNonEmptyString(email) ? email.trim() : "",
-    phone: isNonEmptyString(phone) ? phone.trim() : "",
+  const v = (p || "").toString().trim().toUpperCase();
+  if (!v) return "";
+  const MAP = {
+    "GOOGLE": "GOOGLE",
+    "GOOGLE MAPS": "GOOGLE",
+    "GMAPS": "GOOGLE",
+    "YELP": "YELP",
+    "TRUSTPILOT": "TRUSTPILOT",
+    "TRUST PILOT": "TRUSTPILOT",
+    "FACEBOOK": "FACEBOOK",
+    "META": "FACEBOOK",
+    "BING": "BING",
+    "MICROSOFT": "BING",
+    "REVIEWBUILDER": "REVIEWBUILDER",
+    "SURVEYS": "SURVEYS",
   };
+  return MAP[v] || v;
 }
 
-/* -------------------- deep text scan -------------------- */
-function deepScanForText(obj) {
-  if (!obj || typeof obj !== "object") return null;
+/** -------------------- RB extractor (robust) -------------------- **
+ * Extracts open-text answers while ignoring booleans, links, dates and ratings.
+ * Picks up to 3 distinct answers, longest/most-relevant first.
+ */
+export function extractRBText(review) {
+  const rows = Array.isArray(review?.reviewData) ? review.reviewData : [];
+  const out = [];
+  for (const r of rows) {
+    const raw =
+      r?.value ?? r?.answer ?? r?.text ?? r?.comment ?? r?.response ?? null;
+    if (!isNonEmptyString(raw)) continue;
 
-  if (Array.isArray(obj)) {
-    for (const it of obj) {
-      const found = deepScanForText(it);
-      if (found) return found;
-    }
-    return null;
+    const val = String(raw).trim();
+    const name = String(r?.name || "").toLowerCase();
+
+    // discard booleans, pure numbers/ratings, urls/dates
+    if (isBooleanString(val)) continue;
+    if (looksLikeRating(val)) continue;
+    if (/^https?:\/\//i.test(val)) continue;
+    if (/^\d{4}-\d{2}-\d{2}T/.test(val)) continue;
+
+    // prefer typical free-text prompts
+    const isOpen =
+      /open|words|comment|describe|feedback|verbatim|free/i.test(name);
+
+    out.push({ text: val, boost: isOpen ? 2 : 0, len: val.length });
   }
 
-  for (const [k, v] of Object.entries(obj)) {
-    if (isNonEmptyString(v)) {
-      const s = v.trim();
-      // ignore booleans/urls/blobs
-      if (
-        !/^(true|false|null|undefined)$/i.test(s) &&
-        !/^https?:\/\//i.test(s) &&
-        !/^[A-Za-z0-9+/_=-]{40,}$/.test(s)
-      ) {
-        // prefer likely free-text keys
-        if (
-          /own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/i.test(
-            k
-          )
-        ) {
-          return s;
-        }
-      }
-    } else if (v && typeof v === "object") {
-      const found = deepScanForText(v);
-      if (found) return found;
-    }
+  if (!out.length) return "";
+
+  out.sort((a, b) => (b.boost - a.boost) || (b.len - a.len));
+
+  const seen = new Set();
+  const chosen = [];
+  for (const c of out) {
+    const k = c.text.toLowerCase();
+    if (seen.has(k)) continue;
+    chosen.push(c.text);
+    seen.add(k);
+    if (chosen.length >= 3) break;
   }
-  return null;
+  return chosen.join("\n\n");
 }
 
-/* -------------------- provider-agnostic comment -------------------- */
-export function getProviderComment(provider, data = {}) {
-  if (!data || typeof data !== "object") return "";
+/** -------------------- provider-agnostic comment getter --------- **
+ * If provider is REVIEWBUILDER (surveys), derive the open-text using
+ * extractRBText. Otherwise prefer direct text fields.
+ */
+export function getProviderComment(provider, reviewLike) {
+  const p = normalizeProvider(provider || reviewLike?.contentProvider || "");
+  const direct =
+    reviewLike?.comment ??
+    reviewLike?.reviewText ??
+    reviewLike?.text ??
+    reviewLike?.body ??
+    null;
 
-  // direct/common fields first
-  const directPaths = [
-    "text",
-    "comment",
-    "body",
-    "reviewText",
-    "reviewBody",
-    "review.text",
-    "review.comment",
-    "reviewData.commentText",
-    "reviewData.freeText",
-    "reviewData.reviewBody",
-  ];
-  for (const path of directPaths) {
-    const parts = path.split(".");
-    let val = data;
-    for (const p of parts)
-      val = val && typeof val === "object" ? val[p] : undefined;
-    if (isNonEmptyString(val)) {
-      const s = String(val).trim();
-      if (
-        !/^(true|false|null|undefined)$/i.test(s) &&
-        !/^[A-Za-z0-9+/_=-]{40,}$/.test(s)
-      ) {
-        return s;
-      }
-    }
+  if (p === "REVIEWBUILDER") {
+    const rb = extractRBText(reviewLike);
+    if (isNonEmptyString(rb)) return rb;
+    if (isNonEmptyString(direct) && !isBooleanString(direct)) return direct.trim();
+    return "";
   }
 
-  // ReviewBuilder: Q&A array under reviewData[]
-  if (Array.isArray(data.reviewData)) {
-    const best = [];
-    for (const rd of data.reviewData) {
-      const name = String(rd?.name || "").toLowerCase();
-      const val = String(rd?.value ?? rd?.answer ?? "").trim();
-      if (!isNonEmptyString(val)) continue;
-      if (
-        /own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/.test(
-          name
-        )
-      )
-        best.push(val);
-    }
-    if (best.length) return best.join("\n\n");
-  }
+  if (isNonEmptyString(direct) && !isBooleanString(direct)) return direct.trim();
 
-  // Legacy answers[]
-  if (Array.isArray(data.answers)) {
-    const best = [];
-    for (const a of data.answers) {
-      const q = String(a?.question || "").toLowerCase();
-      const val = String(a?.answer || "").trim();
-      if (!isNonEmptyString(val)) continue;
-      if (
-        /own\s*words|experience|feedback|comment|describe|verbatim|free\s*text/.test(
-          q
-        )
-      )
-        best.push(val);
-    }
-    if (best.length) return best.join("\n\n");
-  }
+  // try a few other common fields used by some providers
+  const candidates = [
+    reviewLike?.reviewerComment,
+    reviewLike?.content,
+    reviewLike?.review,
+  ]
+    .map((x) => (isNonEmptyString(x) ? x.trim() : ""))
+    .filter(Boolean);
 
-  // Final fallback: deep recursive scan
-  const found = deepScanForText(data);
-  return isNonEmptyString(found) ? found : "";
+  if (candidates.length) {
+    candidates.sort((a, b) => b.length - a.length);
+    return candidates[0];
+  }
+  return "";
 }
 
-/* -------------------- stars + note -------------------- */
-function stars(n) {
+/** -------------------- small helpers for formatting ------------- **/
+export function stars(n) {
   const x = Math.max(0, Math.min(5, Number(n) || 0));
   return "★".repeat(x) + "☆".repeat(5 - x);
 }
 
 export function buildInternalNote({
   dt,
-  customerName,
-  customerEmail,
-  customerPhone,
+  customer,
   provider,
-  origin,
   locationName,
   locationId,
   rating,
   comment,
   viewUrl,
 }) {
-  const lines = [
+  return [
     "Review Information",
     "",
     `Date: ${dt || "-"}`,
-    `Customer: ${customerName || "-"}`,
-    customerEmail ? `Customer Email: ${customerEmail}` : undefined,
-    customerPhone ? `Customer Phone: ${customerPhone}` : undefined,
+    `Customer: ${customer || "-"}`,
     `Provider: ${provider || "-"}`,
-    origin ? `Origin: ${origin}` : undefined,
-    `Location: ${
-      locationName ? `${locationName} (${locationId || "-"})` : locationId || "-"
-    }`,
+    `Location: ${locationName ? `${locationName} (${locationId || "-"})` : (locationId || "-")}`,
     `Rating: ${stars(rating)}`,
-    `Comment:`,
+    "Comment:",
     isNonEmptyString(comment) ? comment : "(no text)",
     "",
-    isNonEmptyString(viewUrl) ? `[View in Chatmeter](${viewUrl})` : "",
+    isNonEmptyString(viewUrl) ? `View in Chatmeter` : "",
     "",
     "_The first public comment on this ticket will be posted to Chatmeter._",
-  ].filter(Boolean);
-  return lines.join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
