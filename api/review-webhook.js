@@ -1,192 +1,198 @@
 // /api/review-webhook.js
-// Create/update Zendesk ticket with ONE INTERNAL card.
-// If incoming text is empty or token-ish, fetch Chatmeter review detail to extract real text.
-// Stronger de-dupe: check external_id, tag, and custom field; use create_or_update.
+// Chatmeter -> Zendesk: create/update ticket with ONE INTERNAL card (idempotent)
+// If the incoming comment is empty/boolean, we still extract proper text via helpers.
+// We stamp each posted note with a hidden marker and skip re-posting duplicates.
 
 import {
   getProviderComment,
   buildInternalNote,
   isNonEmptyString,
-  looksLikeOpaqueId,
-  normalizeProvider,
+  normalizeProvider
 } from "./_helpers.js";
 
-async function fetchReviewDetailSmart({ id, providerReviewId, chmBase, token, accountId }) {
-  if (!token) return null;
-  const headers = { Authorization: token };
+/* ---------------- idempotent note helpers ---------------- */
 
-  const paths = [
-    `/reviews/${encodeURIComponent(String(id || providerReviewId || ""))}`,
-    `/reviewBuilder/reviews/${encodeURIComponent(String(id || providerReviewId || ""))}`,
-  ].filter(Boolean);
-
-  for (const p of paths) {
-    const url = `${chmBase}${p}${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ""}`;
-    try {
-      const r = await fetch(url, { headers });
-      const t = await r.text();
-      if (!r.ok) continue;
-      try { return JSON.parse(t); } catch { return {}; }
-    } catch (_) {}
-  }
-  return null;
+function hashNote(s) {
+  // djb2 (XOR variant) -> base36
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+  return (h >>> 0).toString(36);
 }
+
+function withMarker(note, reviewId) {
+  const h = hashNote(note);
+  const marker = `cmrvw:${reviewId}:${h}`;
+  const marked = `${note}\n\n<!-- ${marker} -->`;
+  return { marked, marker };
+}
+
+async function noteAlreadyPosted({ zBase, auth, ticketId, marker }) {
+  // Look at recent audits for the unique marker we append to the note body.
+  // If found, we won't post the same note again.
+  const url = `${zBase}/tickets/${ticketId}/audits.json?sort_order=desc&page=1&per_page=30`;
+  const r = await fetch(url, {
+    headers: {
+      Authorization: auth,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+  });
+  if (!r.ok) return false;
+  const j = await r.json();
+  if (!Array.isArray(j?.audits)) return false;
+
+  for (const a of j.audits) {
+    if (!Array.isArray(a?.events)) continue;
+    for (const e of a.events) {
+      if (typeof e?.body === "string" && e.body.includes(marker)) return true;
+    }
+  }
+  return false;
+}
+
+/* ---------------- main handler ---------------- */
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const {
-    ZENDESK_SUBDOMAIN,
-    ZENDESK_EMAIL,
-    ZENDESK_API_TOKEN,
-    ZD_FIELD_REVIEW_ID,
-    ZD_FIELD_LOCATION_ID,
-    ZD_FIELD_RATING,
-    ZD_FIELD_FIRST_REPLY_SENT,
-    ZD_FIELD_LOCATION_NAME,
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
+  const ZD_EMAIL     = process.env.ZENDESK_EMAIL;
+  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
 
-    CHATMETER_V5_BASE = "https://live.chatmeter.com/v5",
-    CHATMETER_V5_TOKEN,
-    CHM_ACCOUNT_ID,
-  } = process.env;
+  const F_REVIEW_ID  = process.env.ZD_FIELD_REVIEW_ID;         // text
+  const F_LOCATIONID = process.env.ZD_FIELD_LOCATION_ID;       // number/text
+  const F_RATING     = process.env.ZD_FIELD_RATING;            // number
+  const F_FIRST      = process.env.ZD_FIELD_FIRST_REPLY_SENT;  // checkbox
+  const F_LOCNAME    = process.env.ZD_FIELD_LOCATION_NAME;     // optional
 
   const missing = [
-    !ZENDESK_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
-    !ZENDESK_EMAIL && "ZENDESK_EMAIL",
-    !ZENDESK_API_TOKEN && "ZENDESK_API_TOKEN",
-    !ZD_FIELD_REVIEW_ID && "ZD_FIELD_REVIEW_ID",
-    !ZD_FIELD_LOCATION_ID && "ZD_FIELD_LOCATION_ID",
-    !ZD_FIELD_RATING && "ZD_FIELD_RATING",
-    !ZD_FIELD_FIRST_REPLY_SENT && "ZD_FIELD_FIRST_REPLY_SENT",
+    !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
+    !ZD_EMAIL     && "ZENDESK_EMAIL",
+    !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
+    !F_REVIEW_ID  && "ZD_FIELD_REVIEW_ID",
+    !F_LOCATIONID && "ZD_FIELD_LOCATION_ID",
+    !F_RATING     && "ZD_FIELD_RATING",
+    !F_FIRST      && "ZD_FIELD_FIRST_REPLY_SENT",
   ].filter(Boolean);
   if (missing.length) return res.status(500).send(`Missing env: ${missing.join(", ")}`);
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const reviewId       = body.id || body.reviewId || body.providerReviewId;
-    const provider       = normalizeProvider(body.provider || body.contentProvider || "");
-    const locationId     = body.locationId || "";
-    const locationName   = body.locationName || "";
-    const rating         = Number(body.rating || 0);
-    const createdAt      = body.createdAt || body.reviewDate || new Date().toISOString();
-    const authorName     = body.authorName || body.reviewerUserName || body.reviewer || "";
-    const publicUrl      = body.publicUrl || body.reviewURL || body.portalUrl || "";
 
-    let comment = isNonEmptyString(body.text) ? body.text.trim() : getProviderComment(provider, body);
-    if (!isNonEmptyString(comment) || looksLikeOpaqueId(comment)) {
-      const detail = await fetchReviewDetailSmart({
-        id: body.id, providerReviewId: body.providerReviewId,
-        chmBase: CHATMETER_V5_BASE, token: CHATMETER_V5_TOKEN, accountId: CHM_ACCOUNT_ID
-      });
-      if (detail && typeof detail === "object") {
-        const fromDetail = getProviderComment(provider, detail);
-        if (isNonEmptyString(fromDetail)) comment = fromDetail.trim();
-        else {
-          const raw = detail.reviewText || detail.text || detail.body || detail.comment || "";
-          if (isNonEmptyString(raw) && !looksLikeOpaqueId(raw)) comment = raw.trim();
-        }
-      }
-    }
+    // Normalize inbound payload
+    const reviewId     = body.id || body.reviewId || body.providerReviewId;
+    if (!reviewId) return res.status(400).send("Missing id");
+    const provider     = normalizeProvider((body.provider || body.contentProvider || "").toString());
+    const locationId   = body.locationId || "";
+    const locationName = body.locationName || "";
+    const rating       = Number(body.rating || 0);
+    const createdAt    = body.createdAt || body.reviewDate || new Date().toISOString();
+    const authorName   = body.authorName || body.reviewerUserName || body.reviewer || "";
+    const publicUrl    = body.publicUrl || body.reviewURL || body.portalUrl || "";
 
-    const external_id  = `chatmeter:${reviewId}`;
-    const tagProvider  = provider ? provider.toLowerCase() : "chatmeter";
-    const tagReview    = `cmrvw_${reviewId}`;
+    const text = isNonEmptyString(body.text)
+      ? body.text.trim()
+      : getProviderComment(provider, body);
 
-    const note = buildInternalNote({
+    const external_id = `chatmeter:${reviewId}`;
+    const tagProvider = provider ? provider.toLowerCase() : "chatmeter";
+
+    // Compose INTERNAL note (then wrap with idempotent marker)
+    const rawNote = buildInternalNote({
       dt: createdAt,
       customer: authorName,
       provider,
       locationName,
       locationId,
       rating,
-      comment,
+      comment: text,
       viewUrl: publicUrl,
     });
+    const { marked: note, marker } = withMarker(rawNote, reviewId);
 
-    const zBase = `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2`;
-    const auth  = "Basic " + Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString("base64");
+    // Zendesk HTTP helpers
+    const zBase = `https://${ZD_SUBDOMAIN}.zendesk.com/api/v2`;
+    const auth  = "Basic " + Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
     const zGet  = (path) => fetch(`${zBase}${path}`, {
-      headers: { Authorization: auth, "Content-Type": "application/json", "Accept": "application/json" }
+      headers: { Authorization: auth, "Content-Type": "application/json", Accept: "application/json" }
     });
     const zSend = (path, method, payload) => fetch(`${zBase}${path}`, {
       method,
-      headers: { Authorization: auth, "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify(payload)
+      headers: { Authorization: auth, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
     });
 
-    // ---- Stronger de-dupe lookups ----
-    async function findExistingTicket() {
-      // 1) by external_id
-      const q1 = encodeURIComponent(`type:ticket external_id:"${external_id}"`);
-      for (const q of [q1]) {
-        const r = await zGet(`/search.json?query=${q}`);
-        if (r.ok) {
-          const j = await r.json();
-          if (Array.isArray(j?.results) && j.results.length) return j.results[0].id;
-        }
+    // 1) de-dupe BY TICKET using external_id
+    let ticketId = null;
+    {
+      const q = encodeURIComponent(`type:ticket external_id:"${external_id}"`);
+      const r = await zGet(`/search.json?query=${q}`);
+      if (!r.ok) {
+        const t = await r.text();
+        return res.status(400).send(`Zendesk lookup failed: ${r.status}\n${t}`);
       }
-      // 2) by tag cmrvw_<id>
-      const q2 = encodeURIComponent(`type:ticket tags:${tagReview}`);
-      {
-        const r = await zGet(`/search.json?query=${q2}`);
-        if (r.ok) {
-          const j = await r.json();
-          if (Array.isArray(j?.results) && j.results.length) return j.results[0].id;
-        }
-      }
-      // 3) by custom field (review id)
-      const cfId = Number(ZD_FIELD_REVIEW_ID);
-      if (cfId) {
-        // Zendesk supports search on custom fields: custom_field_<id>:<value>
-        const q3 = encodeURIComponent(`type:ticket custom_field_${cfId}:"${String(reviewId)}"`);
-        const r = await zGet(`/search.json?query=${q3}`);
-        if (r.ok) {
-          const j = await r.json();
-          if (Array.isArray(j?.results) && j.results.length) return j.results[0].id;
-        }
-      }
-      return null;
+      const data = await r.json();
+      ticketId = data?.results?.[0]?.id || null;
     }
 
-    let ticketId = await findExistingTicket();
-
+    // Common fields/tags for either create or update
     const baseCustoms = [];
-    baseCustoms.push({ id: +ZD_FIELD_REVIEW_ID,   value: String(reviewId || "") });
-    baseCustoms.push({ id: +ZD_FIELD_LOCATION_ID, value: String(locationId || "") });
-    baseCustoms.push({ id: +ZD_FIELD_RATING,      value: rating || 0 });
-    if (ZD_FIELD_LOCATION_NAME) baseCustoms.push({ id: +ZD_FIELD_LOCATION_NAME, value: locationName || "" });
+    baseCustoms.push({ id: +F_REVIEW_ID,  value: String(reviewId || "") });
+    baseCustoms.push({ id: +F_LOCATIONID, value: String(locationId || "") });
+    baseCustoms.push({ id: +F_RATING,     value: rating || 0 });
+    if (F_LOCNAME) baseCustoms.push({ id: +F_LOCNAME, value: locationName || "" });
 
     const requesterEmail = "reviews@drivo.com";
-    const commonTags = ["chatmeter", tagProvider, tagReview];
+    const commonTags = ["chatmeter", tagProvider, `cmrvw_${reviewId}`];
 
-    const payload = {
+    // 2) CREATE if no ticket exists
+    if (!ticketId) {
+      const payload = {
+        ticket: {
+          subject: `${locationName || "Location"} – ${"★".repeat(Math.max(0, Math.min(5, rating)))} – ${authorName || "Reviewer"}`,
+          requester: { email: requesterEmail, name: requesterEmail },
+          external_id,
+          tags: commonTags,
+          custom_fields: baseCustoms,
+          comment: { body: note, public: false }
+        }
+      };
+      const r = await zSend(`/tickets.json`, "POST", payload);
+      const t = await r.text();
+      if (!r.ok) return res.status(400).send(`Zendesk create failed: ${r.status}\n${t}`);
+      const j = JSON.parse(t);
+      ticketId = j?.ticket?.id;
+      return res.status(200).json({ ok: true, action: "created", id: ticketId, externalId: external_id });
+    }
+
+    // 3) UPDATE existing ticket
+    // Check if we've already posted this exact note; if so, skip re-posting it.
+    let shouldPostComment = true;
+    try {
+      const exists = await noteAlreadyPosted({ zBase, auth, ticketId, marker });
+      if (exists) shouldPostComment = false;
+    } catch {
+      // If audits read fails, treat as not found (we’ll post)
+      shouldPostComment = true;
+    }
+
+    const updatePayload = {
       ticket: {
-        subject: `${locationName || "Location"} – ${"★".repeat(Math.max(0, Math.min(5, rating)))} – ${authorName || "Reviewer"}`,
-        requester: { email: requesterEmail, name: requesterEmail },
         external_id,
         tags: commonTags,
         custom_fields: baseCustoms,
-        comment: { body: note, public: false }
+        ...(shouldPostComment ? { comment: { body: note, public: false } } : {})
       }
     };
 
-    // Use create_or_update: if external_id exists, Zendesk updates instead of creating a duplicate.
-    const endpoint = ticketId ? `/tickets/${ticketId}.json` : `/tickets/create_or_update.json`;
-    const method   = ticketId ? "PUT" : "POST";
+    const rU = await zSend(`/tickets/${ticketId}.json`, "PUT", updatePayload);
+    const tU = await rU.text();
+    if (!rU.ok) return res.status(400).send(`Zendesk update failed: ${rU.status}\n${tU}`);
 
-    const rSave = await zSend(endpoint, method, payload);
-    const tSave = await rSave.text();
-    if (!rSave.ok) {
-      return res.status(400).send(`Zendesk ${ticketId ? "update" : "create_or_update"} failed: ${rSave.status}\n${tSave}`);
-    }
-
-    // Normalize response
-    let savedId = ticketId;
-    try { savedId = JSON.parse(tSave)?.ticket?.id || ticketId; } catch {}
     return res.status(200).json({
       ok: true,
-      action: ticketId ? "updated" : "create_or_update",
-      id: savedId,
+      action: shouldPostComment ? "updated_with_note" : "updated_no_duplicate_note",
+      id: ticketId,
       externalId: external_id
     });
 
