@@ -123,7 +123,8 @@ export default async function handler(req, res) {
     }
 
     // ---- Ticket payload ----
-    const subject = `[${capitalize(platform)}][${locationName}] ${shorten(content, 80)}`;
+    const ratingTxt = rating != null ? `${rating}/5` : "Review";
+const subject = `${locationName} — ${ratingTxt}`;
 
     const lines = [];
     lines.push(`Platform: ${capitalize(platform)}`);
