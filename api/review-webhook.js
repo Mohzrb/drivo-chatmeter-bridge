@@ -1,48 +1,28 @@
 // Chatmeter → Zendesk (create ticket)
-// Deployed on Vercel as: POST https://<your-app>.vercel.app/api/review-webhook
+// POST https://<your-app>.vercel.app/api/review-webhook
+export default async function handler(req, res) {
+  if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
 
-type ReviewPayload = {
-  id?: string;
-  reviewId?: string;            // allow either id or reviewId
-  locationId?: string | number;
-  locationName?: string;
-  rating?: number;
-  authorName?: string;
-  createdAt?: string;
-  text?: string;
-  publicUrl?: string;
-  portalUrl?: string;
-};
+  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
+  const ZD_EMAIL = process.env.ZENDESK_EMAIL;
+  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
+  const ZD_FIELD_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID;
+  const ZD_FIELD_LOCATION_ID = process.env.ZD_FIELD_LOCATION_ID;
+  const ZD_FIELD_RATING = process.env.ZD_FIELD_RATING;
+  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT;
 
-const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN!;
-const ZD_EMAIL = process.env.ZENDESK_EMAIL!;
-const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN!;
-const ZD_FIELD_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID;                 // number as string
-const ZD_FIELD_LOCATION_ID = process.env.ZD_FIELD_LOCATION_ID;             // number as string
-const ZD_FIELD_RATING = process.env.ZD_FIELD_RATING;                       // number as string
-const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT;   // number as string
-
-function badEnv() {
   const missing = [
     !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
     !ZD_EMAIL && "ZENDESK_EMAIL",
     !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
   ].filter(Boolean);
-  return missing.length ? `Missing env: ${missing.join(", ")}` : null;
-}
+  if (missing.length) { res.status(500).send(`Missing env: ${missing.join(", ")}`); return; }
 
-export default async function handler(req: Request): Promise<Response> {
   try {
-    if (req.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405 });
-    }
-    const envErr = badEnv();
-    if (envErr) return new Response(envErr, { status: 500 });
-
-    const body = (await req.json()) as ReviewPayload;
-
-    // Normalize fields
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const reviewId = body.id || body.reviewId || "";
+    if (!reviewId) { res.status(400).send("Missing reviewId/id"); return; }
+
     const locationId = body.locationId ?? "";
     const locationName = body.locationName ?? "Unknown Location";
     const rating = body.rating ?? 0;
@@ -51,10 +31,6 @@ export default async function handler(req: Request): Promise<Response> {
     const text = body.text ?? "";
     const publicUrl = body.publicUrl ?? "";
     const portalUrl = body.portalUrl ?? "";
-
-    if (!reviewId) {
-      return new Response("Missing reviewId/id", { status: 400 });
-    }
 
     const subject = `${locationName} – ${rating}★ – ${authorName}`;
     const description = [
@@ -71,46 +47,36 @@ export default async function handler(req: Request): Promise<Response> {
       portalUrl ? `Chatmeter URL: ${portalUrl}` : ""
     ].filter(Boolean).join("\n");
 
-    // Build Zendesk ticket payload
-    const ticket: any = {
+    const ticket = {
       ticket: {
         subject,
         comment: { body: description, public: true },
         requester: { name: authorName, email: "reviews@drivo.com" },
-        tags: ["chatmeter", "review", "inbound"],
+        tags: ["chatmeter", "review", "inbound"]
       }
     };
 
-    // Optional custom fields if you set their IDs
-    const custom_fields: { id: number; value: any }[] = [];
+    const custom_fields = [];
     if (ZD_FIELD_REVIEW_ID) custom_fields.push({ id: +ZD_FIELD_REVIEW_ID, value: String(reviewId) });
     if (ZD_FIELD_LOCATION_ID) custom_fields.push({ id: +ZD_FIELD_LOCATION_ID, value: String(locationId) });
     if (ZD_FIELD_RATING) custom_fields.push({ id: +ZD_FIELD_RATING, value: rating });
     if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
     if (custom_fields.length) ticket.ticket.custom_fields = custom_fields;
 
-    // Create the ticket
-    const zendeskRes = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
+    const auth = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
+    const zdRes = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Basic " + Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64"),
-      },
-      body: JSON.stringify(ticket),
+      headers: { "Content-Type": "application/json", "Authorization": "Basic " + auth },
+      body: JSON.stringify(ticket)
     });
 
-    if (!zendeskRes.ok) {
-      const errTxt = await zendeskRes.text();
-      return new Response(`Zendesk error: ${zendeskRes.status} ${errTxt}`, { status: 502 });
+    if (!zdRes.ok) {
+      const errTxt = await zdRes.text();
+      res.status(502).send(`Zendesk error: ${zdRes.status} ${errTxt}`); return;
     }
-
-    const data = await zendeskRes.json();
-    return new Response(JSON.stringify({ ok: true, createdTicketId: data?.ticket?.id ?? null }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-
-  } catch (e: any) {
-    return new Response(`Error: ${e?.message || e}`, { status: 500 });
+    const data = await zdRes.json();
+    res.status(200).json({ ok: true, createdTicketId: data?.ticket?.id ?? null });
+  } catch (e) {
+    res.status(500).send(`Error: ${e?.message || e}`);
   }
 }
