@@ -1,143 +1,126 @@
-// /api/poll-v2.js
-// Pull reviews since ?minutes=N and POST each to /api/review-webhook
-// Robust diagnostics for Chatmeter 401/403
+// api/poll-v2.js
+// Poll Chatmeter for last ?minutes=N and POST each review to /api/review-webhook (authorized)
 
 export default async function handler(req, res) {
   if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
 
   try {
-    // --- auth to call this poller (your existing middleware may already do this)
+    // optional auth for calling the poller
+    const okBearer = process.env.AUTH_SECRET ? `Bearer ${process.env.AUTH_SECRET}` : null;
     const auth = req.headers.authorization || "";
-    const okBearer = `Bearer ${process.env.AUTH_SECRET}`;
     if (okBearer && auth !== okBearer) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
-    // --- time window
-    const minutes = Math.max(1, Math.min(7 * 24 * 60, Number(req.query.minutes || 1440)));
-    const max = Math.max(1, Math.min(500, Number(req.query.max || 100)));
+    // time window
+    const minutes = clampInt(req.query.minutes ?? 1440, 1, 7 * 24 * 60);
+    const max = clampInt(req.query.max ?? 100, 1, 500);
     const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    // --- env
-    const CM_BASE = process.env.CHATMETER_BASE || "https://live.chatmeter.com/v5";
-    const CM_API_KEY = process.env.CHATMETER_API_KEY || "";
-    const CM_BEARER = process.env.CHATMETER_TOKEN || "";
-    const CM_ACCOUNT = process.env.CHATMETER_ACCOUNT_ID || ""; // optional per tenant
+    // env (supports both CHATMETER_* and legacy CM_*)
+    const CM_BASE = process.env.CHATMETER_BASE || process.env.CM_BASE || "https://live.chatmeter.com/v5";
+    const CM_TOKEN = process.env.CHATMETER_TOKEN || process.env.CM_TOKEN || "";
+    const CM_API_KEY = process.env.CHATMETER_API_KEY || ""; // some tenants use x-api-key
+    const CM_ACCOUNT = process.env.CHATMETER_ACCOUNT_ID || "";
 
-    const Z_BASE = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : ""; // optional if same host
+    const Z_BASE = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "";
     const WEBHOOK = "/api/review-webhook";
+    const WH_SECRET = process.env.WEBHOOK_SECRET || "";
 
-    if (!CM_API_KEY && !CM_BEARER) {
-      return res.status(500).json({ ok: false, error: "Missing CHATMETER_API_KEY or CHATMETER_TOKEN" });
+    if (!CM_TOKEN && !CM_API_KEY) {
+      return res.status(500).json({ ok: false, error: "Missing CHATMETER_TOKEN or CHATMETER_API_KEY" });
     }
 
-    // --- headers builder
     const cmHeaders = () => {
       const h = { Accept: "application/json" };
+      if (CM_TOKEN) h["Authorization"] = `Bearer ${CM_TOKEN}`;
       if (CM_API_KEY) h["x-api-key"] = CM_API_KEY;
-      if (CM_BEARER) h["Authorization"] = `Bearer ${CM_BEARER}`;
-      if (CM_ACCOUNT) h["x-account-id"] = CM_ACCOUNT; // some tenants need this
+      if (CM_ACCOUNT) h["x-account-id"] = CM_ACCOUNT;
       return h;
     };
 
-    // --- tiny helper for fetch with good error messages
     const getJson = async (url) => {
       const r = await fetch(url, { headers: cmHeaders() });
-      if (!r.ok) {
-        const body = await r.text();
-        return { ok: false, status: r.status, url, body_snippet: body.slice(0, 800) };
-      }
-      return { ok: true, json: await r.json(), status: r.status, url };
+      if (!r.ok) return { ok: false, status: r.status, body: await r.text() };
+      return { ok: true, status: r.status, json: await r.json() };
     };
 
-    // --- probes (very helpful to diagnose 401)
-    const probePaths = [
-      "/me",
-      "/status",
-      `/locations?limit=1&offset=0${CM_ACCOUNT ? `&accountId=${encodeURIComponent(CM_ACCOUNT)}` : ""}`,
-      `/reviews?limit=1&offset=0${CM_ACCOUNT ? `&accountId=${encodeURIComponent(CM_ACCOUNT)}` : ""}`,
-    ];
-    for (const p of probePaths) {
-      const probe = await getJson(`${CM_BASE}${p}`);
+    // quick probes (helpful if auth fails)
+    for (const path of ["/me", "/status"]) {
+      const probe = await getJson(`${CM_BASE}${path}`);
       if (!probe.ok) {
         return res.status(502).json({
-          ok: false,
-          error: `Chatmeter ${probe.status} on ${p}`,
-          body_snippet: probe.body_snippet || "",
-          hint: hintFor401({ hasKey: !!CM_API_KEY, hasBearer: !!CM_BEARER, hasAccount: !!CM_ACCOUNT }),
+          ok: false, error: `Chatmeter ${probe.status} on ${path}`,
+          hint: hintFor401({ hasBearer: !!CM_TOKEN, hasKey: !!CM_API_KEY, hasAccount: !!CM_ACCOUNT })
         });
       }
     }
 
-    // --- main list (adjust to your API; many tenants use /reviews with since)
-    const listUrl = `${CM_BASE}/reviews?since=${encodeURIComponent(since)}&limit=${max}${
-      CM_ACCOUNT ? `&accountId=${encodeURIComponent(CM_ACCOUNT)}` : ""
-    }`;
+    // list reviews (common: /reviews?since=ISO&limit=N[&accountId=...])
+    const listUrl = `${CM_BASE}/reviews?since=${encodeURIComponent(since)}&limit=${max}${CM_ACCOUNT ? `&accountId=${encodeURIComponent(CM_ACCOUNT)}` : ""}`;
     const listed = await getJson(listUrl);
     if (!listed.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: `Chatmeter list error ${listed.status}`,
-        body_snippet: listed.body_snippet || "",
-        url: listed.url,
-      });
+      return res.status(502).json({ ok: false, error: `Chatmeter list error ${listed.status}`, body: listed.body?.slice(0, 800) });
     }
 
-    const items = Array.isArray(listed.json?.data) ? listed.json.data : (listed.json?.reviews || []);
-    if (!Array.isArray(items)) {
-      return res.status(200).json({ ok: true, checked: 0, posted: 0, skipped: 0, errors: 0, note: "No array in response" });
+    // tolerate shapes: {data:[...]}, {reviews:[...]}, [...]
+    const arr = Array.isArray(listed.json?.data) ? listed.json.data
+              : Array.isArray(listed.json?.reviews) ? listed.json.reviews
+              : (Array.isArray(listed.json) ? listed.json : []);
+    if (!Array.isArray(arr)) {
+      return res.status(200).json({ ok: true, since, checked: 0, posted: 0, skipped: 0, errors: 0, note: "No array in response" });
     }
 
-    // --- post each review to the webhook
     let posted = 0, skipped = 0, errors = 0;
-    for (const r of items) {
+    for (const r of arr) {
       const payload = normalizeReview(r);
       if (!payload?.id) { skipped++; continue; }
 
-      const resp = await fetch(`${Z_BASE || ""}${WEBHOOK}`, {
+      const resp = await fetch(`${Z_BASE}${WEBHOOK}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        headers: {
+          "Content-Type": "application/json",
+          ...(WH_SECRET ? { Authorization: `Bearer ${WH_SECRET}` } : {})
+        },
+        body: JSON.stringify(payload)
       });
 
-      if (!resp.ok) {
-        errors++;
-      } else {
-        const j = await resp.json().catch(() => ({}));
-        if (j?.ok) posted++; else errors++;
-      }
+      if (!resp.ok) { errors++; continue; }
+      const j = await resp.json().catch(() => null);
+      if (j?.ok) posted++; else errors++;
+      await sleep(150); // gentle pacing
     }
 
-    return res.status(200).json({ ok: true, since, checked: items.length, posted, skipped, errors });
+    return res.status(200).json({ ok: true, since, checked: arr.length, posted, skipped, errors });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
 
-// --- simple mapper; adapt fields if your tenant differs
+// map Chatmeter review → intake payload
 function normalizeReview(r) {
   return {
+    platform: r.platform || r.provider || r.source || "unknown",
     id: r.id || r.reviewId || r.providerReviewId,
-    provider: r.provider || r.platform || r.source || "",
-    locationId: r.locationId || r.location?.id || "",
-    locationName: r.locationName || r.location?.name || "",
-    rating: r.rating || r.stars || 0,
+    rating: r.rating ?? r.stars ?? null,
+    author: { name: r.authorName || r.author || r.reviewer || "Unknown Reviewer" },
+    content: r.text || r.comment || r.content || "",
+    url: r.publicUrl || r.url || r.link || "",
+    location: { name: r.locationName || (r.location && r.location.name) || "" },
     createdAt: r.createdAt || r.reviewDate || r.created || new Date().toISOString(),
-    authorName: r.authorName || r.author || r.reviewer || "",
-    publicUrl: r.publicUrl || r.url || r.link || "",
-    text: r.text || r.comment || r.content || "",
+    nps: r.nps ? { score: r.nps.score, category: r.nps.category } : undefined,
+    customer: r.customer ? { email: r.customer.email, name: r.customer.name } : undefined
   };
 }
 
-function hintFor401({ hasKey, hasBearer, hasAccount }) {
-  const lines = [];
-  lines.push("Double-check Chatmeter credentials and tenant requirements:");
-  if (!hasKey && !hasBearer) lines.push("- Set CHATMETER_API_KEY (x-api-key) or CHATMETER_TOKEN (Bearer).");
-  if (hasKey && hasBearer) lines.push("- Using both is OK; either one will be sent.");
-  lines.push("- Ensure CHATMETER_BASE is correct for your tenant (often https://live.chatmeter.com/v5).");
-  lines.push("- Some tenants require x-account-id or accountId=... → set CHATMETER_ACCOUNT_ID.");
-  lines.push("- If using Bearer, confirm the token isn’t expired and has scopes for /me, /reviews.");
-  return lines.join("\n");
+function clampInt(v, min, max){ const n = Number(v); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : min; }
+function hintFor401({ hasBearer, hasKey, hasAccount }) {
+  const tips = [];
+  tips.push("Double-check Chatmeter credentials:");
+  if (!hasBearer && !hasKey) tips.push("- Provide CHATMETER_TOKEN (Bearer) or CHATMETER_API_KEY (x-api-key).");
+  tips.push("- Confirm CHATMETER_BASE for your tenant (often https://live.chatmeter.com/v5).");
+  if (hasAccount) tips.push("- accountId/x-account-id is being sent.");
+  tips.push("- Token/key must allow /me, /status, /reviews.");
+  return tips.join(" ");
 }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
