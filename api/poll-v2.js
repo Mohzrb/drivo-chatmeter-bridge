@@ -1,9 +1,16 @@
-// Poller v2 — login, then probe /me to discover account/org scope (no Zendesk writes)
+// Poller v2 — login, discover scope, then fetch reviews under /{scope}/{id}/reviews (no Zendesk writes yet)
+
 function envAny(...names) { for (const n of names) if (process.env[n]) return process.env[n]; return ""; }
+function pickId(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const keys = ["id","accountId","organizationId","orgId","clientId","companyId","businessId","locationId","profileId"];
+  for (const k of keys) if (obj[k] != null) return String(obj[k]);
+  return null;
+}
 
 export default async function handler(req, res) {
   try {
-    // Method + CRON_SECRET auth
+    // 1) Method + CRON auth
     if (req.method !== "GET") {
       res.statusCode = 405;
       res.setHeader("Content-Type", "application/json");
@@ -18,94 +25,102 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
     }
 
-    // Inputs
+    // 2) Inputs
     const minutes = Math.max(1, parseInt(req.query.minutes || "60", 10));
     const max = Math.max(1, parseInt(req.query.max || "5", 10));
     const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    // Env (accept mixed-case var names)
+    // 3) Env (accept mixed case)
     const base = envAny("CHATMETER_V5_BASE") || "https://live.chatmeter.com/v5";
-    const user = envAny("CHATMETER_USERNAME", "Chatmeter_username", "chatmeter_username");
-    const pass = envAny("CHATMETER_PASSWORD", "Chatmeter_password", "chatmeter_password");
+    const user = envAny("CHATMETER_USERNAME","Chatmeter_username","chatmeter_username");
+    const pass = envAny("CHATMETER_PASSWORD","Chatmeter_password","chatmeter_password");
     if (!user || !pass) {
       res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, stage: "env", error: "Missing CHATMETER_USERNAME or CHATMETER_PASSWORD" }));
+      res.setHeader("Content-Type","application/json");
+      return res.end(JSON.stringify({ ok:false, stage:"env", error:"Missing CHATMETER_USERNAME or CHATMETER_PASSWORD" }));
     }
 
-    // 1) LOGIN
+    // 4) LOGIN
     const lr = await fetch(`${base}/login`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ username: user, password: pass }),
+      headers: { "Content-Type":"application/json", Accept:"application/json" },
+      body: JSON.stringify({ username:user, password:pass }),
       cache: "no-store"
     });
-    const loginText = await lr.text();
-    let loginJson = null; try { loginJson = JSON.parse(loginText); } catch {}
+    const loginTxt = await lr.text();
+    let loginJson = null; try { loginJson = JSON.parse(loginTxt); } catch {}
     const token = loginJson?.token || loginJson?.access_token || "";
     if (!token) {
       res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, stage: "login", status: lr.status, bodyPreview: loginText.slice(0, 800) }));
+      res.setHeader("Content-Type","application/json");
+      return res.end(JSON.stringify({ ok:false, stage:"login", status: lr.status, bodyPreview: loginTxt.slice(0,800) }));
     }
 
-    // 2) Probe /me with several header styles to get tenant/org info
-    const attempts = [
-      { name: "Authorization: Bearer", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } },
-      { name: "Authorization: Token",  headers: { Authorization: `Token ${token}`,  Accept: "application/json" } }
-    ];
+    // 5) Probe likely list endpoints to find your scope + id
+    const scopes = ["accounts","organizations","clients","companies","groups","brands","locations","businesses","profiles"];
+    const probeResults = [];
+    let chosenScope = null, chosenId = null;
 
-    let me = null, meStatus = null, mePreview = null, meHeaders = null;
-    for (const a of attempts) {
-      const r = await fetch(`${base}/me`, { headers: a.headers, cache: "no-store" });
-      meStatus = r.status;
-      const txt = await r.text().catch(() => "");
-      if (r.ok) {
-        try { me = JSON.parse(txt); meHeaders = a.name; break; }
-        catch { /* keep trying */ }
-      } else {
-        mePreview = txt.slice(0, 600);
+    for (const scope of scopes) {
+      let status = null, text = null, arr = null, id = null;
+      try {
+        const r = await fetch(`${base}/${scope}?limit=1`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+          cache: "no-store"
+        });
+        status = r.status;
+        text = await r.text().catch(()=>"");
+        if (r.ok) {
+          try {
+            const js = JSON.parse(text);
+            const list = Array.isArray(js?.data) ? js.data : (Array.isArray(js) ? js : []);
+            arr = list;
+            id = list[0] ? pickId(list[0]) : null;
+          } catch { /* ignore */ }
+        }
+      } catch (e) {
+        probeResults.push({ scope, fetchError: String(e?.message || e) });
+        continue;
       }
+      probeResults.push({
+        scope, status, ok: !!arr, sampleKeys: arr?.[0] ? Object.keys(arr[0]) : null, idPreview: id
+      });
+      if (arr && id) { chosenScope = scope; chosenId = id; break; }
     }
 
-    // If /me failed, return diagnostics so we can adjust
-    if (!me) {
+    if (!chosenScope || !chosenId) {
       res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Content-Type","application/json");
       return res.end(JSON.stringify({
-        ok: false,
-        stage: "me",
-        meStatus,
-        mePreview,
-        note: "If /me is not available on your tenant, we will probe organization/account endpoints next."
+        ok:false, stage:"scope-discovery", base, probeResults
       }));
     }
 
-    // Extract likely identifiers (best-effort keys)
-    const keys = Object.keys(me || {});
-    const orgId = me.organizationId || me.orgId || me.accountId || me.clientId || me.companyId || me.tenantId || null;
-
-    // Return what we found so we can decide the correct reviews path
+    // 6) Try scoped reviews path
+    const url = `${base}/${chosenScope}/${encodeURIComponent(chosenId)}/reviews?since=${encodeURIComponent(sinceIso)}&limit=${max}`;
+    const rr = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept:"application/json" },
+      cache: "no-store"
+    });
+    const rtxt = await rr.text().catch(()=> "");
+    if (!rr.ok) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type","application/json");
+      return res.end(JSON.stringify({
+        ok:false, stage:"scoped-reviews", scope: chosenScope, id: chosenId, status: rr.status, bodyPreview: rtxt.slice(0,800)
+      }));
+    }
+    let data = null; try { data = JSON.parse(rtxt); } catch {}
+    const reviews = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
     res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Content-Type","application/json");
     return res.end(JSON.stringify({
-      ok: true,
-      stage: "me-ok",
-      meHeaders,
-      keys,
-      orgHints: {
-        organizationId: me.organizationId || null,
-        orgId: me.orgId || null,
-        accountId: me.accountId || null,
-        clientId: me.clientId || null,
-        companyId: me.companyId || null,
-        tenantId: me.tenantId || null
-      },
-      suggestion: "If org/account id is present, next we will try /organizations/{id}/reviews or /accounts/{id}/reviews"
+      ok:true, stage:"chatmeter-ok", scope: chosenScope, id: chosenId, sinceIso,
+      checked: reviews.length, sampleKeys: reviews[0] ? Object.keys(reviews[0]) : null
     }));
   } catch (e) {
     res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: false, stage: "top-catch", error: String(e?.message || e) }));
+    res.setHeader("Content-Type","application/json");
+    return res.end(JSON.stringify({ ok:false, stage:"top-catch", error:String(e?.message || e) }));
   }
 }
