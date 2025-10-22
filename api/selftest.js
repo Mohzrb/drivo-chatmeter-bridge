@@ -1,8 +1,6 @@
 import { json } from "./_helpers.js";
 
-function present(name) {
-  return !!process.env[name];
-}
+function present(name) { return !!process.env[name]; }
 
 export default function handler(req, res) {
   const env = {
@@ -23,15 +21,12 @@ export default function handler(req, res) {
     CHATMETER_V5_TOKEN: present("CHATMETER_V5_TOKEN"),
     CHATMETER_TOKEN: present("CHATMETER_TOKEN"),
     CHATMETER_API_KEY: present("CHATMETER_API_KEY"),
+    CHATMETER_USERNAME: present("CHATMETER_USERNAME"),
+    CHATMETER_PASSWORD: present("CHATMETER_PASSWORD"),
     SELF_BASE_URL: present("SELF_BASE_URL"),
     CRON_SECRET: present("CRON_SECRET"),
     POLLER_LOOKBACK_MINUTES: present("POLLER_LOOKBACK_MINUTES")
   };
 
-  return json(res, 200, {
-    ok: true,
-    route: "/api/selftest",
-    env,
-    vars
-  });
+  return json(res, 200, { ok: true, route: "/api/selftest", env, vars });
 }
