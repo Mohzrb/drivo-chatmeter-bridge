@@ -1,18 +1,14 @@
-// Poller v2 — login-first, then try multiple headers for /reviews
-function envAny(...names) {
-  for (const n of names) if (process.env[n]) return process.env[n];
-  return "";
-}
+// Poller v2 — login, capture Set-Cookie, then call /reviews with cookie (and variations)
+function envAny(...names) { for (const n of names) if (process.env[n]) return process.env[n]; return ""; }
 
 export default async function handler(req, res) {
   try {
+    // 1) Method + CRON_SECRET auth
     if (req.method !== "GET") {
       res.statusCode = 405;
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
     }
-
-    // Auth: Authorization: Bearer <CRON_SECRET>
     const auth = req.headers.authorization || "";
     const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     const cron = envAny("CRON_SECRET");
@@ -22,108 +18,118 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
     }
 
+    // 2) Inputs
     const minutes = Math.max(1, parseInt(req.query.minutes || "60", 10));
     const max = Math.max(1, parseInt(req.query.max || "5", 10));
     const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
+    // 3) Env (accept mixed-case var names you used)
     const base = envAny("CHATMETER_V5_BASE") || "https://live.chatmeter.com/v5";
-    // Accept mixed-case env names (seen in your Vercel)
     const user = envAny("CHATMETER_USERNAME", "Chatmeter_username", "chatmeter_username");
     const pass = envAny("CHATMETER_PASSWORD", "Chatmeter_password", "chatmeter_password");
-
     if (!user || !pass) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({
         ok: false, stage: "env",
-        error: "Missing CHATMETER_USERNAME or CHATMETER_PASSWORD",
-        presence: {
-          CHATMETER_USERNAME_upper: !!process.env.CHATMETER_USERNAME,
-          CHATMETER_USERNAME_mixed: !!process.env.Chatmeter_username,
-          CHATMETER_PASSWORD_upper: !!process.env.CHATMETER_PASSWORD,
-          CHATMETER_PASSWORD_mixed: !!process.env.Chatmeter_password
-        }
+        error: "Missing CHATMETER_USERNAME or CHATMETER_PASSWORD"
       }));
     }
 
-    // 1) LOGIN
-    let loginStatus = null, loginJson = null, token = null;
-    try {
-      const lr = await fetch(`${base}/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ username: user, password: pass }),
-        cache: "no-store"
-      });
-      loginStatus = lr.status;
-      const t = await lr.text();
-      try { loginJson = JSON.parse(t); } catch { loginJson = { raw: t?.slice(0, 600) }; }
-      token = loginJson?.token || loginJson?.access_token || null;
-    } catch (e) {
+    // 4) LOGIN — capture token AND Set-Cookie
+    const loginResp = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ username: user, password: pass }),
+      cache: "no-store"
+    });
+
+    const loginText = await loginResp.text();
+    let loginJson = null;
+    try { loginJson = JSON.parse(loginText); } catch { /* ignore */ }
+
+    // Chatmeter may set a session cookie (e.g., connect.sid)
+    // Node fetch exposes only the first cookie via headers.get('set-cookie'); newer runtimes can include multiple values.
+    const setCookie = loginResp.headers.get("set-cookie") || "";
+
+    // Token (if also returned)
+    const token = loginJson?.token || loginJson?.access_token || "";
+
+    if (!loginResp.ok && !setCookie && !token) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, stage: "login-fetch", error: String(e?.message || e) }));
-    }
-    if (!token) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, stage: "login", status: loginStatus, body: loginJson }));
+      return res.end(JSON.stringify({
+        ok: false, stage: "login",
+        status: loginResp.status,
+        bodyPreview: loginText.slice(0, 600)
+      }));
     }
 
-    // 2) /reviews with multiple header styles
+    // 5) Try /reviews with different auth combos (cookie, cookie+bearer, bearer)
     const url = `${base}/reviews?since=${encodeURIComponent(sinceIso)}&limit=${max}`;
-    const attempts = [
-      { name: "Authorization: Bearer", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } },
-      { name: "Authorization: Token",  headers: { Authorization: `Token ${token}`,  Accept: "application/json" } },
-      { name: "Authorization: Token token=", headers: { Authorization: `Token token=${token}`, Accept: "application/json" } },
-      { name: "Cookie: token=",        headers: { Cookie: `token=${token}`,        Accept: "application/json" } },
-      { name: "X-Auth-Token",          headers: { "X-Auth-Token": token,           Accept: "application/json" } },
-      { name: "X-API-Key",             headers: { "X-API-Key": token,              Accept: "application/json" } }
-    ];
+    const attempts = [];
+
+    // If we got a cookie, try echoing it back
+    if (setCookie) {
+      // The server sent "Set-Cookie: name=value; Path=/; ..." — we must only send "Cookie: name=value"
+      const cookiePair = setCookie.split(";")[0]; // take only "name=value"
+      attempts.push({ name: "Cookie only", headers: { Cookie: cookiePair, Accept: "application/json" } });
+      if (token) {
+        attempts.push({ name: "Cookie + Bearer", headers: { Cookie: cookiePair, Authorization: `Bearer ${token}`, Accept: "application/json" } });
+        attempts.push({ name: "Cookie + Token",  headers: { Cookie: cookiePair, Authorization: `Token ${token}`,  Accept: "application/json" } });
+      }
+    }
+
+    // Header-only fallbacks (we already saw 401, but keep them for completeness)
+    if (token) {
+      attempts.push({ name: "Bearer only", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+      attempts.push({ name: "Token only",  headers: { Authorization: `Token ${token}`,  Accept: "application/json" } });
+    }
 
     const results = [];
-    let chosen = null, data = null;
+    let chosen = null, data = null, finalStatus = null, finalText = null;
 
     for (const attempt of attempts) {
-      let status = null, text = null, ok = false, sampleKeys = null;
       try {
         const r = await fetch(url, { headers: attempt.headers, cache: "no-store" });
-        status = r.status;
-        text = await r.text().catch(() => "");
-        ok = r.ok;
-        if (ok) {
+        finalStatus = r.status;
+        finalText = await r.text().catch(() => "");
+        if (r.ok) {
           try {
-            const js = JSON.parse(text);
+            const js = JSON.parse(finalText);
             const arr = Array.isArray(js?.data) ? js.data : Array.isArray(js) ? js : [];
-            sampleKeys = arr[0] ? Object.keys(arr[0]) : null;
             data = arr;
+            chosen = attempt.name;
+            results.push({ attempt: attempt.name, status: r.status, ok: true, sampleKeys: arr[0] ? Object.keys(arr[0]) : null });
+            break;
           } catch {
-            ok = false; // treat as fail if body isn't valid JSON
+            results.push({ attempt: attempt.name, status: r.status, ok: false, preview: finalText.slice(0, 300) });
           }
+        } else {
+          results.push({ attempt: attempt.name, status: r.status, ok: false, preview: (finalText || "").slice(0, 300) });
         }
       } catch (err) {
         results.push({ attempt: attempt.name, fetchError: String(err?.message || err) });
-        continue;
       }
-      results.push({
-        attempt: attempt.name,
-        status,
-        ok,
-        preview: (text || "").slice(0, 600),
-        sampleKeys
-      });
-      if (ok) { chosen = attempt.name; break; }
     }
 
     if (!chosen) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({
-        ok: false, stage: "reviews-auth", url, results
+        ok: false,
+        stage: "reviews-auth",
+        loginStatus: loginResp.status,
+        gotToken: !!token,
+        gotSetCookie: !!setCookie,
+        setCookiePreview: setCookie ? setCookie.split(";")[0] : null,
+        url,
+        lastStatus: finalStatus,
+        results
       }));
     }
 
-    // success — Chatmeter reachable with header 'chosen'
+    // Success
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({
