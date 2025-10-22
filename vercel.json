@@ -1,5 +1,8 @@
 {
-  "crons": [
-    { "path": "/api/poll-v2", "schedule": "0 2 * * *" }
-  ]
+  "version": 2,
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
 }
