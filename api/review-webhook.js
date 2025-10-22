@@ -1,82 +1,47 @@
-// Chatmeter → Zendesk (create ticket)
-// POST https://<your-app>.vercel.app/api/review-webhook
+import { json } from "./_helpers.js";
+import { normalizeReview } from "../lib/schema.js";
+import {
+  findOrCreateTicketByExternalId,
+  addInternalNote,
+  getTicketAudits
+} from "../lib/zendesk.js";
+import { commentExists } from "../lib/dedupe.js";
+
 export default async function handler(req, res) {
-  if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
-
-  const ZD_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-  const ZD_EMAIL = process.env.ZENDESK_EMAIL;
-  const ZD_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-  const ZD_FIELD_REVIEW_ID = process.env.ZD_FIELD_REVIEW_ID;
-  const ZD_FIELD_LOCATION_ID = process.env.ZD_FIELD_LOCATION_ID;
-  const ZD_FIELD_RATING = process.env.ZD_FIELD_RATING;
-  const ZD_FIELD_FIRST_REPLY_SENT = process.env.ZD_FIELD_FIRST_REPLY_SENT;
-
-  const missing = [
-    !ZD_SUBDOMAIN && "ZENDESK_SUBDOMAIN",
-    !ZD_EMAIL && "ZENDESK_EMAIL",
-    !ZD_API_TOKEN && "ZENDESK_API_TOKEN",
-  ].filter(Boolean);
-  if (missing.length) { res.status(500).send(`Missing env: ${missing.join(", ")}`); return; }
-
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const reviewId = body.id || body.reviewId || "";
-    if (!reviewId) { res.status(400).send("Missing reviewId/id"); return; }
+    if (req.method !== "POST")
+      return json(res, 405, { ok: false, error: "Method Not Allowed" });
 
-    const locationId = body.locationId ?? "";
-    const locationName = body.locationName ?? "Unknown Location";
-    const rating = body.rating ?? 0;
-    const authorName = body.authorName ?? "Chatmeter Reviewer";
-    const createdAt = body.createdAt ?? "";
-    const text = body.text ?? "";
-    const publicUrl = body.publicUrl ?? "";
-    const portalUrl = body.portalUrl ?? "";
+    // Optional shared secret for inbound webhooks
+    const auth = req.headers.authorization || "";
+    const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (process.env.WEBHOOK_SECRET && bearer !== process.env.WEBHOOK_SECRET) {
+      return json(res, 401, { ok: false, error: "Unauthorized" });
+    }
 
-    const subject = `${locationName} – ${rating}★ – ${authorName}`;
-    const description = [
-      `Review ID: ${reviewId}`,
-      `Location: ${locationName} (${locationId})`,
-      `Rating: ${rating}★`,
-      createdAt ? `Date: ${createdAt}` : "",
+    const raw = req.body?.review || req.body;
+    if (!raw) return json(res, 400, { ok: false, error: "Missing review in body" });
+
+    const r = normalizeReview(raw);
+    if (!r.id) return json(res, 400, { ok: false, error: "Missing review id after normalization" });
+
+    const { id: ticketId } = await findOrCreateTicketByExternalId(r);
+
+    const body = [
+      `Provider: ${r.source}`,
+      `Rating: ${r.rating}`,
+      r.url ? `URL: ${r.url}` : null,
       "",
-      "Review Text:",
-      text || "(no text)",
-      "",
-      "Links:",
-      publicUrl ? `Public URL: ${publicUrl}` : "",
-      portalUrl ? `Chatmeter URL: ${portalUrl}` : ""
+      r.content || "(no text)"
     ].filter(Boolean).join("\n");
 
-    const ticket = {
-      ticket: {
-        subject,
-        comment: { body: description, public: true },
-        requester: { name: authorName, email: "reviews@drivo.com" },
-        tags: ["chatmeter", "review", "inbound"]
-      }
-    };
-
-    const custom_fields = [];
-    if (ZD_FIELD_REVIEW_ID) custom_fields.push({ id: +ZD_FIELD_REVIEW_ID, value: String(reviewId) });
-    if (ZD_FIELD_LOCATION_ID) custom_fields.push({ id: +ZD_FIELD_LOCATION_ID, value: String(locationId) });
-    if (ZD_FIELD_RATING) custom_fields.push({ id: +ZD_FIELD_RATING, value: rating });
-    if (ZD_FIELD_FIRST_REPLY_SENT) custom_fields.push({ id: +ZD_FIELD_FIRST_REPLY_SENT, value: false });
-    if (custom_fields.length) ticket.ticket.custom_fields = custom_fields;
-
-    const auth = Buffer.from(`${ZD_EMAIL}/token:${ZD_API_TOKEN}`).toString("base64");
-    const zdRes = await fetch(`https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Basic " + auth },
-      body: JSON.stringify(ticket)
-    });
-
-    if (!zdRes.ok) {
-      const errTxt = await zdRes.text();
-      res.status(502).send(`Zendesk error: ${zdRes.status} ${errTxt}`); return;
+    const audits = await getTicketAudits(ticketId);
+    if (!commentExists(audits, body)) {
+      await addInternalNote(ticketId, body);
     }
-    const data = await zdRes.json();
-    res.status(200).json({ ok: true, createdTicketId: data?.ticket?.id ?? null });
+
+    return json(res, 200, { ok: true, ticketId });
   } catch (e) {
-    res.status(500).send(`Error: ${e?.message || e}`);
+    return json(res, 500, { ok: false, error: String(e?.message || e) });
   }
 }
