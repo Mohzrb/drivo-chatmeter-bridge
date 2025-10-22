@@ -1,9 +1,11 @@
 {
-  "name": "drivo-chatmeter-bridge",
+  "name": "chatmeter-zendesk-bridge",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
+  "description": "Sync Chatmeter reviews into Zendesk (tickets + internal notes) with dedupe and cron.",
+  "type": "module",
   "scripts": {
-    "build": "echo \"Vercel builds serverless functions automatically\""
+    "start": "echo \"Serverless on Vercel — no local start script\"",
+    "lint": "echo \"noop\""
   }
 }
