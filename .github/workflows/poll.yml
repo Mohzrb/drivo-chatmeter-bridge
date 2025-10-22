@@ -1,18 +1,15 @@
-name: Hourly Chatmeter Poll
+name: Chatmeter Poller
+
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *" # every 30 minutes
   workflow_dispatch:
 
 jobs:
-  call:
+  poll:
     runs-on: ubuntu-latest
     steps:
-      - name: Invoke poller
+      - name: Call poll-v2
         run: |
-          curl -fsS -H "Authorization: Bearer $CRON_SECRET" \
-               "${SELF_BASE_URL}/api/poll-v2?minutes=60&accountId=${CHM_ACCOUNT_ID}"
-        env:
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          SELF_BASE_URL: https://drivo-chatmeter-bridge.vercel.app
-          CHM_ACCOUNT_ID: 6646597de7a19144ba286d92
+          curl -sS -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.BASE_URL }}/api/poll-v2?minutes=60&max=20" | jq .
