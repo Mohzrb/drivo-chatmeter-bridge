@@ -1,3 +1,9 @@
-export default async function handler(req, res) {
-  return res.status(200).json({ ok: true, version: "ping-2025-10-07" });
+import { json } from "./_helpers.js";
+
+export default function handler(req, res) {
+  return json(res, 200, {
+    ok: true,
+    service: "up",
+    route: "/api/ping"
+  });
 }
