@@ -1,4 +1,4 @@
-// Poller v2 — stage 2: Chatmeter fetch only (no imports, no Zendesk writes)
+// Poller v2 — Chatmeter multi-auth probe (no Zendesk writes)
 export default async function handler(req, res) {
   try {
     // Only GET
@@ -13,21 +13,10 @@ export default async function handler(req, res) {
     const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     const cron = process.env.CRON_SECRET || "";
 
-    const presence = {
-      CHATMETER_V5_BASE: !!process.env.CHATMETER_V5_BASE,
-      CHATMETER_V5_TOKEN: !!process.env.CHATMETER_V5_TOKEN,
-      CHATMETER_TOKEN: !!process.env.CHATMETER_TOKEN,
-      CHATMETER_API_KEY: !!process.env.CHATMETER_API_KEY,
-      ZENDESK_SUBDOMAIN: !!process.env.ZENDESK_SUBDOMAIN,
-      ZENDESK_EMAIL: !!process.env.ZENDESK_EMAIL,
-      ZENDESK_API_TOKEN: !!process.env.ZENDESK_API_TOKEN,
-      CRON_SECRET: !!cron
-    };
-
     if (!cron || bearer !== cron) {
       res.statusCode = 401;
       res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "Unauthorized", presence }));
+      return res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
     }
 
     // Inputs
@@ -35,7 +24,7 @@ export default async function handler(req, res) {
     const max = Math.max(1, parseInt(req.query.max || "5", 10));
     const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    // Chatmeter token + base
+    // Chatmeter env
     const base = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
     const token =
       process.env.CHATMETER_V5_TOKEN ||
@@ -49,55 +38,51 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({
         ok: false,
         stage: "env",
-        presence,
         error: "Missing Chatmeter token"
       }));
     }
 
-    // Fetch from Chatmeter
     const url = `${base}/reviews?since=${encodeURIComponent(sinceIso)}&limit=${max}`;
-    let status = null, text = null, data = null;
 
-    try {
-      const r = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-        cache: "no-store"
-      });
-      status = r.status;
-      text = await r.text().catch(() => "");
-      try { data = JSON.parse(text); } catch { data = null; }
-    } catch (err) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({
-        ok: false, stage: "chatmeter-fetch", presence, error: String(err?.message || err)
-      }));
-    }
+    // Try several header styles commonly used by APIs
+    const attempts = [
+      { name: "Authorization: Bearer", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } },
+      { name: "Authorization: Token",  headers: { Authorization: `Token ${token}`,  Accept: "application/json" } },
+      { name: "X-Auth-Token",          headers: { "X-Auth-Token": token,            Accept: "application/json" } }
+    ];
 
-    if (status < 200 || status >= 300) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({
-        ok: false,
-        stage: "chatmeter-http",
-        presence,
+    const results = [];
+    for (const attempt of attempts) {
+      let status = null, text = null, json = null, ok = false;
+      try {
+        const r = await fetch(url, { headers: attempt.headers, cache: "no-store" });
+        status = r.status;
+        text = await r.text().catch(() => "");
+        try { json = JSON.parse(text); } catch { json = null; }
+        ok = r.ok;
+      } catch (err) {
+        results.push({ attempt: attempt.name, fetchError: String(err?.message || err) });
+        continue;
+      }
+      results.push({
+        attempt: attempt.name,
         status,
-        url,
-        bodyPreview: (text || "").slice(0, 2000)
-      }));
+        ok,
+        // show first 600 chars in case there's an error body
+        bodyPreview: (text || "").slice(0, 600),
+        sampleKeys: Array.isArray(json?.data) && json.data[0] ? Object.keys(json.data[0]) : null
+      });
+      if (ok) break; // stop on first success
     }
 
-    const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-
-    // DRY mode only (no Zendesk writes yet)
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({
-      ok: true,
-      stage: "chatmeter-ok",
+      ok: results.some(r => r.ok),
+      stage: "chatmeter-multi-auth",
       sinceIso,
-      checked: arr.length,
-      sampleKeys: arr[0] ? Object.keys(arr[0]) : null
+      url,
+      results
     }));
   } catch (e) {
     res.statusCode = 500;
