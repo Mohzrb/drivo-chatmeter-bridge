@@ -1,18 +1,17 @@
-// Poller v2 — Chatmeter multi-auth probe (no Zendesk writes)
+// Poller v2 — Login-first then fetch reviews (no Zendesk writes yet)
 export default async function handler(req, res) {
   try {
-    // Only GET
+    // Allow only GET
     if (req.method !== "GET") {
       res.statusCode = 405;
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
     }
 
-    // Auth: Authorization: Bearer <CRON_SECRET>
+    // Security: Authorization: Bearer <CRON_SECRET>
     const auth = req.headers.authorization || "";
     const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     const cron = process.env.CRON_SECRET || "";
-
     if (!cron || bearer !== cron) {
       res.statusCode = 401;
       res.setHeader("Content-Type", "application/json");
@@ -24,65 +23,87 @@ export default async function handler(req, res) {
     const max = Math.max(1, parseInt(req.query.max || "5", 10));
     const sinceIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    // Chatmeter env
+    // Chatmeter base + creds
     const base = process.env.CHATMETER_V5_BASE || "https://live.chatmeter.com/v5";
-    const token =
-      process.env.CHATMETER_V5_TOKEN ||
-      process.env.CHATMETER_TOKEN ||
-      process.env.CHATMETER_API_KEY ||
-      "";
-
-    if (!token) {
+    const user = process.env.CHATMETER_USERNAME || "";
+    const pass = process.env.CHATMETER_PASSWORD || "";
+    if (!user || !pass) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({
         ok: false,
         stage: "env",
-        error: "Missing Chatmeter token"
+        error: "Missing CHATMETER_USERNAME or CHATMETER_PASSWORD"
       }));
     }
 
-    const url = `${base}/reviews?since=${encodeURIComponent(sinceIso)}&limit=${max}`;
+    // 1) LOGIN to Chatmeter to obtain a fresh token
+    let loginStatus = null, loginJson = null, token = null;
+    try {
+      const lr = await fetch(`${base}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username: user, password: pass }),
+        cache: "no-store"
+      });
+      loginStatus = lr.status;
+      const text = await lr.text();
+      try { loginJson = JSON.parse(text); } catch { loginJson = { raw: text?.slice(0, 600) }; }
+      token = loginJson?.token || loginJson?.access_token || null;
+    } catch (e) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ ok: false, stage: "login-fetch", error: String(e?.message || e) }));
+    }
+    if (!token) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ ok: false, stage: "login", status: loginStatus, body: loginJson }));
+    }
 
-    // Try several header styles commonly used by APIs
+    // 2) Try reviews with the freshly issued token (try a couple of header styles)
+    const url = `${base}/reviews?since=${encodeURIComponent(sinceIso)}&limit=${max}`;
     const attempts = [
       { name: "Authorization: Bearer", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } },
       { name: "Authorization: Token",  headers: { Authorization: `Token ${token}`,  Accept: "application/json" } },
-      { name: "X-Auth-Token",          headers: { "X-Auth-Token": token,            Accept: "application/json" } }
+      { name: "Cookie: token=",        headers: { Cookie: `token=${token}`,        Accept: "application/json" } },
+      { name: "X-Auth-Token",          headers: { "X-Auth-Token": token,           Accept: "application/json" } }
     ];
 
-    const results = [];
+    let chosen = null, data = null, rawText = null, status = null;
     for (const attempt of attempts) {
-      let status = null, text = null, json = null, ok = false;
-      try {
-        const r = await fetch(url, { headers: attempt.headers, cache: "no-store" });
-        status = r.status;
-        text = await r.text().catch(() => "");
-        try { json = JSON.parse(text); } catch { json = null; }
-        ok = r.ok;
-      } catch (err) {
-        results.push({ attempt: attempt.name, fetchError: String(err?.message || err) });
-        continue;
+      const r = await fetch(url, { headers: attempt.headers, cache: "no-store" });
+      status = r.status;
+      rawText = await r.text().catch(() => "");
+      if (r.ok) {
+        try { data = JSON.parse(rawText); } catch { data = null; }
+        chosen = attempt.name;
+        break;
       }
-      results.push({
-        attempt: attempt.name,
-        status,
-        ok,
-        // show first 600 chars in case there's an error body
-        bodyPreview: (text || "").slice(0, 600),
-        sampleKeys: Array.isArray(json?.data) && json.data[0] ? Object.keys(json.data[0]) : null
-      });
-      if (ok) break; // stop on first success
     }
 
+    if (!chosen) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({
+        ok: false,
+        stage: "reviews-auth",
+        tried: attempts.map(a => a.name),
+        lastStatus: status,
+        bodyPreview: (rawText || "").slice(0, 1000)
+      }));
+    }
+
+    const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({
-      ok: results.some(r => r.ok),
-      stage: "chatmeter-multi-auth",
+      ok: true,
+      stage: "chatmeter-ok",
+      headerUsed: chosen,
       sinceIso,
-      url,
-      results
+      checked: arr.length,
+      sampleKeys: arr[0] ? Object.keys(arr[0]) : null
     }));
   } catch (e) {
     res.statusCode = 500;
