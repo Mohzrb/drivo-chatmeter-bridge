@@ -1,23 +1,29 @@
-import { json } from "./_helpers.js";
-import { whoami as zdWho } from "../lib/zendesk.js";
-
+// api/whoami.js — self-contained, no imports
 export default async function handler(req, res) {
   try {
+    const now = new Date().toISOString();
+    const safe = (v) => (v == null ? null : String(v));
+
     const env = {
-      vercelEnv: process.env.VERCEL_ENV || "unknown",
-      commitSha: process.env.VERCEL_GIT_COMMIT_SHA || "unknown",
-      project: process.env.VERCEL_PROJECT_PRODUCTION_URL || "unknown"
+      vercelEnv: safe(process.env.VERCEL_ENV),           // "production" | "preview" | "development"
+      commitSha: safe(process.env.VERCEL_GIT_COMMIT_SHA),
+      project:   safe(process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL),
     };
 
-    const me = await zdWho(); // Calls Zendesk API to identify your account
-    json(res, 200, {
-      ok: true,
-      route: "/api/whoami",
-      version: "whoami-2025-10-10",
-      env,
-      zendesk: me
-    });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(
+      JSON.stringify({
+        ok: true,
+        route: "/api/whoami",
+        version: "whoami-2025-10-23",
+        time: now,
+        env,
+      })
+    );
   } catch (e) {
-    json(res, 500, { ok: false, error: String(e?.message || e) });
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
   }
 }
